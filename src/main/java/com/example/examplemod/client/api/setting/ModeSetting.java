@@ -3,7 +3,7 @@ package com.example.examplemod.client.api.setting;
 import java.util.Arrays;
 import java.util.List;
 
-/** A single choice out of a fixed list of named modes, rendered as a dropdown. */
+/** A single choice out of a fixed list of named modes, rendered as a click-to-cycle toggle. */
 public class ModeSetting extends Setting<String> {
 
     private final List<String> modes;
@@ -27,6 +27,11 @@ public class ModeSetting extends Setting<String> {
     public void cycle() {
         int next = (modes.indexOf(get()) + 1) % modes.size();
         set(modes.get(next));
+    }
+
+    public void previous() {
+        int prev = (modes.indexOf(get()) - 1 + modes.size()) % modes.size();
+        set(modes.get(prev));
     }
 
     public boolean is(String mode) {

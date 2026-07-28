@@ -8,7 +8,6 @@ import com.example.examplemod.client.api.setting.MultiSelectSetting;
 import com.example.examplemod.client.api.setting.NumberSetting;
 import com.example.examplemod.client.api.setting.Setting;
 import com.example.examplemod.client.api.setting.StringSetting;
-import com.example.examplemod.client.gui.dropdown.Dropdown;
 import com.example.examplemod.client.gui.theme.Theme;
 import com.example.examplemod.client.gui.theme.ThemeManager;
 import com.mojang.blaze3d.matrix.MatrixStack;
@@ -17,13 +16,15 @@ import net.minecraft.client.gui.AbstractGui;
 import net.minecraft.client.gui.FontRenderer;
 import org.lwjgl.glfw.GLFW;
 
-/** Renders and drives a single {@link Setting}, picking its widget by the setting's concrete type. */
+/**
+ * Renders and drives a single {@link Setting}, picking its widget by the setting's concrete type.
+ * Every widget is an inline toggle/cycle control - there are no expandable dropdown lists.
+ */
 public class SettingRow extends Component {
 
     public static final int HEIGHT = 16;
 
     private final Setting<?> setting;
-    private final Dropdown dropdown;
 
     private boolean draggingSlider;
     private boolean editingText;
@@ -32,19 +33,6 @@ public class SettingRow extends Component {
     public SettingRow(Setting<?> setting, float x, float y, float width) {
         super(x, y, width, HEIGHT);
         this.setting = setting;
-        this.dropdown = createDropdown();
-    }
-
-    private Dropdown createDropdown() {
-        if (setting instanceof ModeSetting) {
-            ModeSetting mode = (ModeSetting) setting;
-            return new Dropdown(mode.getModes(), x, y + HEIGHT, width, mode::is, mode::set);
-        }
-        if (setting instanceof MultiSelectSetting) {
-            MultiSelectSetting multi = (MultiSelectSetting) setting;
-            return new Dropdown(multi.getOptions(), x, y + HEIGHT, width, multi::isSelected, multi::toggleOption);
-        }
-        return null;
     }
 
     public Setting<?> getSetting() {
@@ -53,21 +41,22 @@ public class SettingRow extends Component {
 
     @Override
     public float getHeight() {
-        return HEIGHT + (dropdown != null ? dropdown.getExpandedHeight() : 0);
-    }
-
-    @Override
-    public void setPosition(float x, float y) {
-        super.setPosition(x, y);
-        if (dropdown != null) {
-            dropdown.setPosition(x, y + HEIGHT);
+        if (setting instanceof MultiSelectSetting) {
+            return HEIGHT * Math.max(1, ((MultiSelectSetting) setting).getOptions().size());
         }
+        return HEIGHT;
     }
 
     @Override
     public void render(MatrixStack matrixStack, int mouseX, int mouseY, float partialTicks) {
         Theme theme = ThemeManager.getCurrent();
         FontRenderer font = Minecraft.getInstance().font;
+
+        if (setting instanceof MultiSelectSetting) {
+            renderMultiSelect(matrixStack, font, theme, (MultiSelectSetting) setting, mouseX, mouseY);
+            return;
+        }
+
         boolean hovered = isHovered(mouseX, mouseY);
         AbstractGui.fill(matrixStack, (int) x, (int) y, (int) (x + width), (int) (y + HEIGHT),
                 hovered ? theme.getRowHovered() : theme.getRowBackground());
@@ -78,10 +67,7 @@ public class SettingRow extends Component {
         } else if (setting instanceof NumberSetting) {
             renderNumber(matrixStack, font, theme, (NumberSetting) setting);
         } else if (setting instanceof ModeSetting) {
-            font.drawShadow(matrixStack, ((ModeSetting) setting).get(),
-                    x + width - font.width(((ModeSetting) setting).get()) - 6, y + 4, theme.getAccent());
-        } else if (setting instanceof MultiSelectSetting) {
-            String label = ((MultiSelectSetting) setting).get().size() + " selected";
+            String label = "< " + ((ModeSetting) setting).get() + " >";
             font.drawShadow(matrixStack, label, x + width - font.width(label) - 6, y + 4, theme.getAccent());
         } else if (setting instanceof StringSetting) {
             String text = editingText ? ((StringSetting) setting).get() + "_" : ((StringSetting) setting).get();
@@ -93,10 +79,6 @@ public class SettingRow extends Component {
             KeySetting key = (KeySetting) setting;
             String label = listeningForKey ? "> _ <" : (key.isBound() ? keyName(key.get()) : "NONE");
             font.drawShadow(matrixStack, label, x + width - font.width(label) - 6, y + 4, theme.getAccent());
-        }
-
-        if (dropdown != null) {
-            dropdown.render(matrixStack, mouseX, mouseY, partialTicks);
         }
     }
 
@@ -118,10 +100,26 @@ public class SettingRow extends Component {
         AbstractGui.fill(matrixStack, barX, barY, (int) (barX + barWidth * progress), barY + 1, theme.getAccent());
     }
 
+    /** One always-visible toggle row per option - no dropdown, just a stack of on/off switches. */
+    private void renderMultiSelect(MatrixStack matrixStack, FontRenderer font, Theme theme, MultiSelectSetting multi, int mouseX, int mouseY) {
+        int rowY = (int) y;
+        for (String option : multi.getOptions()) {
+            boolean hovered = mouseX >= x && mouseX <= x + width && mouseY >= rowY && mouseY <= rowY + HEIGHT;
+            AbstractGui.fill(matrixStack, (int) x, rowY, (int) (x + width), rowY + HEIGHT,
+                    hovered ? theme.getRowHovered() : theme.getRowBackground());
+            font.drawShadow(matrixStack, option, x + 12, rowY + 4, theme.getTextSecondary());
+            int boxX = (int) (x + width - 16);
+            int boxY = rowY + 3;
+            AbstractGui.fill(matrixStack, boxX, boxY, boxX + 10, boxY + 10,
+                    multi.isSelected(option) ? theme.getAccent() : theme.getPanelHeader());
+            rowY += HEIGHT;
+        }
+    }
+
     @Override
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
-        if (dropdown != null && dropdown.mouseClicked(mouseX, mouseY, button)) {
-            return true;
+        if (setting instanceof MultiSelectSetting) {
+            return multiSelectClicked((MultiSelectSetting) setting, mouseX, mouseY);
         }
         if (!isHovered(mouseX, mouseY)) {
             return false;
@@ -131,8 +129,13 @@ public class SettingRow extends Component {
         } else if (setting instanceof NumberSetting) {
             draggingSlider = true;
             updateSlider(mouseX);
-        } else if (setting instanceof ModeSetting || setting instanceof MultiSelectSetting) {
-            dropdown.setOpen(!dropdown.isOpen());
+        } else if (setting instanceof ModeSetting) {
+            ModeSetting mode = (ModeSetting) setting;
+            if (button == 1) {
+                mode.previous();
+            } else {
+                mode.cycle();
+            }
         } else if (setting instanceof StringSetting) {
             editingText = !editingText;
         } else if (setting instanceof ColorSetting) {
@@ -145,6 +148,18 @@ public class SettingRow extends Component {
         } else if (setting instanceof KeySetting) {
             listeningForKey = true;
         }
+        return true;
+    }
+
+    private boolean multiSelectClicked(MultiSelectSetting multi, double mouseX, double mouseY) {
+        if (mouseX < x || mouseX > x + width || mouseY < y || mouseY > y + getHeight()) {
+            return false;
+        }
+        int index = (int) ((mouseY - y) / HEIGHT);
+        if (index < 0 || index >= multi.getOptions().size()) {
+            return false;
+        }
+        multi.toggleOption(multi.getOptions().get(index));
         return true;
     }
 

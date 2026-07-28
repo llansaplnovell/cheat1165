@@ -5,7 +5,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 
-/** Several independent on/off choices out of a fixed list, rendered as a checkbox dropdown. */
+/** Several independent on/off choices out of a fixed list, each rendered as its own toggle row. */
 public class MultiSelectSetting extends Setting<Set<String>> {
 
     private final List<String> options;
