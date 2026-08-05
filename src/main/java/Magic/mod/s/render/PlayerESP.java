@@ -29,12 +29,52 @@
  *   entity.rx() -> EntityLivingBase.isEntityAlive()
  *   Ob0106.Ob0219() (client accent color) -> baseColor ColorValue
  *   Ob0115.Ob0263()  -> FriendManager.isFriend()
+ *
+ * "Minecraft" and "Outline" were NOT dead code in the original, unlike I
+ * first assumed from only reading Ob0110.java — they're implemented by
+ * patching vanilla renderer classes directly, outside the PlayerESP
+ * module's own draw method:
+ *
+ *   - "Outline" is patched into fZ.java (RendererLivingEntity in Magic's
+ *     MCP names): PlayerESP.isEnabled() && ESPModes=="Outline" gates a
+ *     multi-pass GL_STENCIL_TEST silhouette render of the real 3D model
+ *     (confirmed by decoding the obfuscated string-decrypt calls with the
+ *     exact same char-shift algorithm used throughout that codebase —
+ *     decodes to "ESPModes"/"Outline").
+ *   - "Minecraft" is patched into ed.java (RenderGlobal): a method
+ *     (decoded strings: "ESPModes"/"Minecraft") ORs into vanilla's own
+ *     isRenderEntityOutlines() spectator-glow gate, reusing Minecraft's
+ *     native entityOutlineFramebuffer/entityOutlineShader post-process
+ *     pass (shaders/post/entity_outline.json) instead of a custom draw.
+ *
+ * Magic's own net.minecraft.client.renderer.RenderGlobal /
+ * RendererLivingEntity are still 100% stock — that whole vanilla
+ * spectator-outline pipeline (framebuffer, shader, EntityPlayer-only
+ * filtering, per-entity team-color tint via the `renderOutlines` flag)
+ * is intact and unpatched. Two ways to reach the same effect here:
+ *
+ *   - "Outline" is done below in pure module code (renderOutline()), via
+ *     the public RenderManager.renderEntityStatic() API + a standard
+ *     2-pass stencil-silhouette technique. This reproduces the same
+ *     *effect* as Peter's stencil calls, but isn't a byte-for-byte mirror
+ *     of them — I don't have a fully confirmed mapping for Ob0183's exact
+ *     glStencilFunc/glStencilOp constants the way I do for Corner/Box/
+ *     Other, so this is a from-scratch (but standard, well-understood)
+ *     implementation of the same silhouette-outline algorithm.
+ *   - "Minecraft" genuinely needs one small patch to Magic's own compiled
+ *     RenderGlobal.class: isRenderEntityOutlines() has to also return
+ *     true when wantsVanillaOutline() (below) is true. That one method is
+ *     the only piece I can't add by just dropping in a new .java file —
+ *     it requires a targeted bytecode patch (e.g. via Javassist) to the
+ *     already-compiled vanilla class, the same category of change Peter's
+ *     jar has baked in. See PLAYERESP_NOTES.md for the exact patch.
  */
 package Magic.mod.s.render;
 
 import Magic.ink.event.s.EventRender3D;
 import Magic.mod.Category;
 import Magic.mod.Module;
+import Magic.mod.Modules;
 import Magic.mod.value.values.ColorValue;
 import Magic.mod.value.values.EnumValue;
 import Magic.utils.Friend.FriendManager;
@@ -63,11 +103,11 @@ public class PlayerESP extends Module {
         if (this.mc.theWorld == null || this.mc.thePlayer == null) {
             return;
         }
-        // Original: only Corner/Box/Other actually draw anything. "Minecraft"
-        // and "Outline" are present in the mode list but were dead branches
-        // in Ob0110.Ob0216() (no matching if-block) — kept as no-ops here too.
         Mode m = this.mode.getValue();
-        if (m != Mode.Corner && m != Mode.Box && m != Mode.Other) {
+        // "Minecraft" draws nothing here — it works by making vanilla's own
+        // RenderGlobal.isRenderEntityOutlines() return true (see
+        // wantsVanillaOutline() + PLAYERESP_NOTES.md), not via a draw call.
+        if (m == Mode.Minecraft) {
             return;
         }
         float partialTicks = event.partialTicks();
@@ -76,6 +116,9 @@ public class PlayerESP extends Module {
                 continue;
             }
             switch (m) {
+                case Outline:
+                    this.renderOutline(player, partialTicks);
+                    break;
                 case Corner:
                     this.renderCorner(player, partialTicks);
                     break;
@@ -90,6 +133,17 @@ public class PlayerESP extends Module {
         }
         GlStateManager.color(1.0f, 1.0f, 1.0f, 1.0f);
     });
+
+    /**
+     * Called from the small patch to RenderGlobal.isRenderEntityOutlines()
+     * (see PLAYERESP_NOTES.md) — lets "Minecraft" mode reuse vanilla's own
+     * entityOutlineFramebuffer/entityOutlineShader spectator-glow pass
+     * instead of a custom draw call, exactly like the original did.
+     */
+    public static boolean wantsVanillaOutline() {
+        PlayerESP module = Modules.get(PlayerESP.class);
+        return module != null && module.isEnabled() && module.mode.getValue() == Mode.Minecraft;
+    }
 
     public PlayerESP() {
         super("PlayerESP", 0, Category.Render, "Highlights other players (Corner/Box/Other, ported from Peter's PlayerESP).");
@@ -147,6 +201,53 @@ public class PlayerESP extends Module {
         double[] pos = this.interpolatedRenderPos(player, partialTicks);
         int accent = (player.hurtTime > 0 ? HURT_COLOR : this.baseColor.getValue()).getRGB();
         this.drawOtherBadge(pos[0], pos[1], pos[2], -1, accent);
+    }
+
+    // ---- Outline mode : reproduces the fZ.java multi-pass GL_STENCIL_TEST
+    // silhouette effect using only public vanilla API, since Magic's own
+    // RendererLivingEntity hasn't been patched the way Peter's fZ.java was
+    // (see the class-level notes above and PLAYERESP_NOTES.md). Pass 1
+    // renders the real model into the stencil buffer only (color writes
+    // masked off); pass 2 renders a slightly enlarged copy with the
+    // stencil test inverted, so only the outline fringe outside the
+    // original silhouette gets drawn, in our color, with depth test off
+    // (through walls, same as every other mode here). ----
+    private void renderOutline(EntityPlayer player, float partialTicks) {
+        Color color = player.hurtTime > 0 ? HURT_COLOR
+                : FriendManager.isFriend(player.getName()) ? FRIEND_COLOR
+                : this.baseColor.getValue();
+        double[] pos = this.interpolatedRenderPos(player, partialTicks);
+
+        GlStateManager.pushMatrix();
+        GL11.glEnable(GL11.GL_STENCIL_TEST);
+        GL11.glClear(GL11.GL_STENCIL_BUFFER_BIT);
+        GlStateManager.disableDepth();
+
+        GL11.glColorMask(false, false, false, false);
+        GL11.glStencilFunc(GL11.GL_ALWAYS, 1, 0xFF);
+        GL11.glStencilOp(GL11.GL_REPLACE, GL11.GL_REPLACE, GL11.GL_REPLACE);
+        this.mc.getRenderManager().renderEntityStatic(player, partialTicks, false);
+
+        GL11.glColorMask(true, true, true, true);
+        GL11.glStencilFunc(GL11.GL_NOTEQUAL, 1, 0xFF);
+        GL11.glStencilOp(GL11.GL_KEEP, GL11.GL_KEEP, GL11.GL_KEEP);
+        GlStateManager.disableTexture2D();
+        GlStateManager.disableLighting();
+        GlStateManager.color((float) color.getRed() / 255.0f, (float) color.getGreen() / 255.0f, (float) color.getBlue() / 255.0f, 1.0f);
+        double pivotY = pos[1] + player.height / 2.0;
+        GlStateManager.pushMatrix();
+        GlStateManager.translate(pos[0], pivotY, pos[2]);
+        GlStateManager.scale(1.06f, 1.06f, 1.06f);
+        GlStateManager.translate(-pos[0], -pivotY, -pos[2]);
+        this.mc.getRenderManager().renderEntityStatic(player, partialTicks, false);
+        GlStateManager.popMatrix();
+
+        GlStateManager.enableTexture2D();
+        GlStateManager.enableLighting();
+        GL11.glDisable(GL11.GL_STENCIL_TEST);
+        GlStateManager.enableDepth();
+        GlStateManager.color(1.0f, 1.0f, 1.0f, 1.0f);
+        GlStateManager.popMatrix();
     }
 
     private double[] interpolatedRenderPos(EntityPlayer player, float partialTicks) {
