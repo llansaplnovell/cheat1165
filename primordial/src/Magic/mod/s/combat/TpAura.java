@@ -36,11 +36,13 @@ import pisi.unitedmeows.eventapi.event.listener.Listener;
 public class TpAura extends Module {
     public EnumValue<TpMode> mode = new EnumValue<TpMode>("Mode", this, TpMode.class, "Teleport methods.");
     private BoolValue block = new BoolValue("Block", this, false, "Auto block.");
+    private BoolValue debug = new BoolValue("Debug", this, false, "Prints state to chat.");
     private List<EntityLivingBase> targets = new ArrayList<EntityLivingBase>();
     private EntityLivingBase curTar;
     private boolean hit;
     private boolean postHit;
     private Timer timer = new Timer();
+    private Timer logTimer = new Timer();
     private List<Vec3> list = new ArrayList<Vec3>();
     private AStar aStar = new AStar();
 
@@ -52,7 +54,9 @@ public class TpAura extends Module {
         this.targets = this.getTargets();
         if (this.targets.isEmpty()) {
             this.list.clear();
+            this.curTar = null;
             this.postHit = false;
+            this.logTick("no targets");
             return;
         }
         this.curTar = Collections.min(this.targets,
@@ -82,11 +86,14 @@ public class TpAura extends Module {
         } else {
             this.hit = false;
         }
+        this.logTick("targets=" + this.targets.size() + " target=" + this.curTar.getName()
+                + " dist=" + String.format("%.2f", this.mc.thePlayer.getDistanceToEntity(this.curTar))
+                + " delay=" + (int) delay + " hit=" + this.hit);
         this.postHit = false;
     });
 
     private Listener<EventPostUpdate> onPost = new Listener<EventPostUpdate>(event -> {
-        if (this.hit) {
+        if (this.hit && this.curTar != null) {
             this.postHit = true;
             if (this.mc.thePlayer.isBlocking()) {
                 ClientUtils.packet(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM,
@@ -115,6 +122,8 @@ public class TpAura extends Module {
             } else if (this.mode.getValue() == TpMode.Vanilla) {
                 this.teleport();
             }
+            this.log("attack " + this.curTar.getName() + " mode=" + this.mode.getValue().name()
+                    + " path=" + (this.mode.getValue() == TpMode.NCP ? path.size() : this.list.size()));
             ClientUtils.packet(new C02PacketUseEntity(this.curTar, C02PacketUseEntity.Action.ATTACK));
             if (sprinting) {
                 ClientUtils.packet(new C0BPacketEntityAction(this.mc.thePlayer, C0BPacketEntityAction.Action.START_SPRINTING));
@@ -173,6 +182,9 @@ public class TpAura extends Module {
                 this.curTar.getPosition(), 100)) {
             this.list.add(new Vec3((double) position.x + 0.5, position.y, position.z));
         }
+        if (this.list.isEmpty()) {
+            this.log("A* returned an empty path");
+        }
         for (Vec3 position : this.list) {
             ClientUtils.send(position.xCoord, position.yCoord, position.zCoord, true);
         }
@@ -182,6 +194,19 @@ public class TpAura extends Module {
     public void onEnable() {
         this.timer.reset();
         super.onEnable();
+        this.log("enabled, mode=" + this.mode.getValue().name());
+    }
+
+    private void log(Object message) {
+        if (this.debug.getValue().booleanValue()) {
+            ClientUtils.debug("[TpAura] " + message);
+        }
+    }
+
+    private void logTick(Object message) {
+        if (this.debug.getValue().booleanValue() && this.logTimer.delayReset(1000.0f)) {
+            ClientUtils.debug("[TpAura] " + message);
+        }
     }
 
     @Override
