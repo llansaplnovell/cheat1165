@@ -111,27 +111,38 @@ public class PlayerESP extends Module {
             return;
         }
         float partialTicks = event.partialTicks();
-        for (EntityPlayer player : ClientUtils.getPlayers()) {
-            if (player == this.mc.thePlayer || player.isDead || !player.isEntityAlive()) {
-                continue;
+        try {
+            for (EntityPlayer player : ClientUtils.getPlayers()) {
+                if (player == this.mc.thePlayer || player.isDead || !player.isEntityAlive()) {
+                    continue;
+                }
+                // Caught per-entity on purpose: this fires on the shared
+                // BasicEventSystem, which doesn't guard listener.call() at
+                // all — one bad entity throwing here could otherwise take
+                // down every other module's EventRender3D listener (e.g.
+                // NameTags) for the rest of that frame, not just this one.
+                try {
+                    switch (m) {
+                        case Outline:
+                            this.renderOutline(player, partialTicks);
+                            break;
+                        case Corner:
+                            this.renderCorner(player, partialTicks);
+                            break;
+                        case Box:
+                            this.renderBox(player);
+                            break;
+                        case Other:
+                            this.renderOther(player, partialTicks);
+                            break;
+                        default:
+                    }
+                } catch (Exception ignored) {
+                }
             }
-            switch (m) {
-                case Outline:
-                    this.renderOutline(player, partialTicks);
-                    break;
-                case Corner:
-                    this.renderCorner(player, partialTicks);
-                    break;
-                case Box:
-                    this.renderBox(player);
-                    break;
-                case Other:
-                    this.renderOther(player, partialTicks);
-                    break;
-                default:
-            }
+        } finally {
+            GlStateManager.color(1.0f, 1.0f, 1.0f, 1.0f);
         }
-        GlStateManager.color(1.0f, 1.0f, 1.0f, 1.0f);
     });
 
     /**
@@ -212,6 +223,13 @@ public class PlayerESP extends Module {
     // stencil test inverted, so only the outline fringe outside the
     // original silhouette gets drawn, in our color, with depth test off
     // (through walls, same as every other mode here). ----
+    // NOTE: wrapped in try/finally on purpose — if renderEntityStatic() ever
+    // throws for some edge-case entity (missing skin, mid-despawn, whatever),
+    // an unguarded colorMask(false,false,false,false) or a left-on
+    // GL_STENCIL_TEST would silently break *all* rendering for the rest of
+    // the session (looks exactly like a black screen). Every bit of GL
+    // state this method touches is restored in the finally blocks below,
+    // no matter what happens in between.
     private void renderOutline(EntityPlayer player, float partialTicks) {
         Color color = player.hurtTime > 0 ? HURT_COLOR
                 : FriendManager.isFriend(player.getName()) ? FRIEND_COLOR
@@ -219,35 +237,43 @@ public class PlayerESP extends Module {
         double[] pos = this.interpolatedRenderPos(player, partialTicks);
 
         GlStateManager.pushMatrix();
-        GL11.glEnable(GL11.GL_STENCIL_TEST);
-        GL11.glClear(GL11.GL_STENCIL_BUFFER_BIT);
-        GlStateManager.disableDepth();
+        try {
+            GL11.glEnable(GL11.GL_STENCIL_TEST);
+            GL11.glClear(GL11.GL_STENCIL_BUFFER_BIT);
+            GlStateManager.disableDepth();
 
-        GL11.glColorMask(false, false, false, false);
-        GL11.glStencilFunc(GL11.GL_ALWAYS, 1, 0xFF);
-        GL11.glStencilOp(GL11.GL_REPLACE, GL11.GL_REPLACE, GL11.GL_REPLACE);
-        this.mc.getRenderManager().renderEntityStatic(player, partialTicks, false);
+            GL11.glColorMask(false, false, false, false);
+            try {
+                GL11.glStencilFunc(GL11.GL_ALWAYS, 1, 0xFF);
+                GL11.glStencilOp(GL11.GL_REPLACE, GL11.GL_REPLACE, GL11.GL_REPLACE);
+                this.mc.getRenderManager().renderEntityStatic(player, partialTicks, false);
+            } finally {
+                GL11.glColorMask(true, true, true, true);
+            }
 
-        GL11.glColorMask(true, true, true, true);
-        GL11.glStencilFunc(GL11.GL_NOTEQUAL, 1, 0xFF);
-        GL11.glStencilOp(GL11.GL_KEEP, GL11.GL_KEEP, GL11.GL_KEEP);
-        GlStateManager.disableTexture2D();
-        GlStateManager.disableLighting();
-        GlStateManager.color((float) color.getRed() / 255.0f, (float) color.getGreen() / 255.0f, (float) color.getBlue() / 255.0f, 1.0f);
-        double pivotY = pos[1] + player.height / 2.0;
-        GlStateManager.pushMatrix();
-        GlStateManager.translate(pos[0], pivotY, pos[2]);
-        GlStateManager.scale(1.06f, 1.06f, 1.06f);
-        GlStateManager.translate(-pos[0], -pivotY, -pos[2]);
-        this.mc.getRenderManager().renderEntityStatic(player, partialTicks, false);
-        GlStateManager.popMatrix();
-
-        GlStateManager.enableTexture2D();
-        GlStateManager.enableLighting();
-        GL11.glDisable(GL11.GL_STENCIL_TEST);
-        GlStateManager.enableDepth();
-        GlStateManager.color(1.0f, 1.0f, 1.0f, 1.0f);
-        GlStateManager.popMatrix();
+            GL11.glStencilFunc(GL11.GL_NOTEQUAL, 1, 0xFF);
+            GL11.glStencilOp(GL11.GL_KEEP, GL11.GL_KEEP, GL11.GL_KEEP);
+            GlStateManager.disableTexture2D();
+            GlStateManager.disableLighting();
+            GlStateManager.color((float) color.getRed() / 255.0f, (float) color.getGreen() / 255.0f, (float) color.getBlue() / 255.0f, 1.0f);
+            double pivotY = pos[1] + player.height / 2.0;
+            GlStateManager.pushMatrix();
+            try {
+                GlStateManager.translate(pos[0], pivotY, pos[2]);
+                GlStateManager.scale(1.06f, 1.06f, 1.06f);
+                GlStateManager.translate(-pos[0], -pivotY, -pos[2]);
+                this.mc.getRenderManager().renderEntityStatic(player, partialTicks, false);
+            } finally {
+                GlStateManager.popMatrix();
+            }
+        } finally {
+            GlStateManager.enableTexture2D();
+            GlStateManager.enableLighting();
+            GL11.glDisable(GL11.GL_STENCIL_TEST);
+            GlStateManager.enableDepth();
+            GlStateManager.color(1.0f, 1.0f, 1.0f, 1.0f);
+            GlStateManager.popMatrix();
+        }
     }
 
     private double[] interpolatedRenderPos(EntityPlayer player, float partialTicks) {

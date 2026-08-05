@@ -25,7 +25,16 @@ public class PatchRenderGlobal {
 
         CtClass renderGlobal = pool.get("net.minecraft.client.renderer.RenderGlobal");
         CtMethod method = renderGlobal.getDeclaredMethod("isRenderEntityOutlines");
-        method.insertBefore("if (Magic.mod.s.render.PlayerESP.wantsVanillaOutline()) { return true; }");
+        // The null-check on entityOutlineFramebuffer/entityOutlineShader is
+        // load-bearing, not optional: the very next lines that use
+        // isRenderEntityOutlines() (framebufferRenderExt/framebufferClear/
+        // bindFramebuffer) assume "true" means those objects are ready. An
+        // earlier version of this patch skipped that check and returned
+        // true unconditionally whenever PlayerESP wanted vanilla-outline
+        // mode — on a build where the shader/framebuffer hadn't actually
+        // been created yet, that NPEs every frame inside the render loop,
+        // which looks exactly like a black screen on entering any world.
+        method.insertBefore("if (this.entityOutlineFramebuffer != null && this.entityOutlineShader != null && Magic.mod.s.render.PlayerESP.wantsVanillaOutline()) { return true; }");
         renderGlobal.writeFile(outDir);
 
         System.out.println("Patched isRenderEntityOutlines(), wrote class to " + outDir);

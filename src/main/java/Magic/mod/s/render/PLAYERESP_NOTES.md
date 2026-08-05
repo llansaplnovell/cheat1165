@@ -1,5 +1,28 @@
 # PlayerESP — перенос в Magic (primordial), MC 1.8.9
 
+## FIX: чёрный экран при входе в мир (был баг в первой версии патча)
+Причина: патч `RenderGlobal.isRenderEntityOutlines()` возвращал `true` без
+проверки `entityOutlineFramebuffer != null && entityOutlineShader != null`.
+А код чуть ниже (framebufferRenderExt/framebufferClear/bindFramebuffer)
+считает, что раз метод вернул `true` — эти объекты точно созданы, и
+дёргает их без доп. проверки. Если в билде шейдер/framebuffer ещё не
+инициализированы (`makeEntityOutlineShader()` не отработал/шейдеры
+недоступны) — это NPE **каждый кадр** внутри рендер-лупа = чёрный экран в
+любом мире, если PlayerESP был включён с режимом Minecraft (это
+дефолтный режим — ordinal 0 у `Mode`).
+
+Исправлено: тот же null-check, что в оригинальной ванильной ветке,
+добавлен и в наше условие (см. `tools/PatchRenderGlobal.java`).
+
+Заодно обернул `renderOutline()` (Outline-режим) в try/finally — если
+`renderEntityStatic()` бросит исключение на какой-то редкой сущности,
+`glColorMask(false,...)`/`GL_STENCIL_TEST` больше не останутся навсегда
+сломанными на весь сеанс (это тоже выглядит как "чёрный экран", просто из
+другого места). И обернул сам цикл по игрокам в `onRender3D` в try/catch
+на сущность — общая `BasicEventSystem.fire()` ничего не ловит сама, так
+что один битый игрок раньше мог обрушить остальные модули с
+`EventRender3D` (например NameTags) на этот кадр.
+
 ## Что это
 Дословный перенос PlayerESP из декомпила Peter-клиента (`Ob0110.java` +
 рендер-утилита `Ob0183.java`) на API Magic. Все режимы, все магические
