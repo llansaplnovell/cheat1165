@@ -229,16 +229,16 @@ public class PlayerESP extends Module {
             } else {
                 ClientUtils.debug("PlayerESP: Minecraft mode active.");
             }
-            // Full state dump — one line, so a screenshot of it is enough to
-            // tell exactly which precondition is the one saying no.
+            // Full state dump. The composite line is the interesting one now:
+            // it reports the real GL state sampled at blit time plus which
+            // framebuffer was bound, so we stop inferring from screenshots.
             ClientUtils.debug("PlayerESP state: fboEnabled=" + OpenGlHelper.isFramebufferEnabled()
-                    + " fboSetting=" + mc.gameSettings.fboEnable
-                    + " shadersSupported=" + OpenGlHelper.shadersSupported
-                    + " fastRender=" + optifine.Config.isFastRender()
-                    + " ofShaders=" + optifine.Config.isShaders()
-                    + " aa=" + optifine.Config.isAntialiasing()
+                    + " chain=" + loadedOutlineChain()
                     + " outlineShader=" + sawShader + " outlineFbo=" + sawFramebuffer
                     + " hookRan=" + hookRan);
+            ClientUtils.debug("PlayerESP composite: " + compositeGlState
+                    + " | mainFbo=" + (mc.getFramebuffer() == null ? "null" : String.valueOf(mc.getFramebuffer().framebufferObject))
+                    + " display=" + mc.displayWidth + "x" + mc.displayHeight);
         } catch (Throwable ignored) {
         }
     }
@@ -260,6 +260,9 @@ public class PlayerESP extends Module {
      * Setting it with raw GL11 here forces the real state regardless of what
      * the cache thinks. Only touched while this mode is actually running.
      */
+    /** GL state observed at composite time, captured before we override it. */
+    private static volatile String compositeGlState = "not sampled";
+
     public static void forceOutlineBlend() {
         // Same decision the gate makes, so the GL state is only forced on
         // frames that actually composite — otherwise this would leave blend
@@ -268,10 +271,48 @@ public class PlayerESP extends Module {
             return;
         }
         try {
+            compositeGlState = "blend=" + GL11.glIsEnabled(GL11.GL_BLEND)
+                    + " src=" + GL11.glGetInteger(GL11.GL_BLEND_SRC)
+                    + " dst=" + GL11.glGetInteger(GL11.GL_BLEND_DST)
+                    + " alphaTest=" + GL11.glIsEnabled(GL11.GL_ALPHA_TEST)
+                    + " depthTest=" + GL11.glIsEnabled(GL11.GL_DEPTH_TEST)
+                    + " boundFbo=" + GL11.glGetInteger(36006); // GL_FRAMEBUFFER_BINDING
             GL11.glEnable(GL11.GL_BLEND);
             GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
             GL11.glDisable(GL11.GL_ALPHA_TEST);
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            compositeGlState = "sample failed: " + t;
+        }
+    }
+
+    /**
+     * Whether the entity_outline chain the game actually loaded is the patched
+     * one. Read through the resource manager, i.e. exactly the path the game
+     * itself takes, so an external assets dir or a resource pack overriding
+     * the jar's copy shows up here instead of being invisible.
+     */
+    private static String loadedOutlineChain() {
+        java.io.InputStream in = null;
+        try {
+            in = Minecraft.getMinecraft().getResourceManager()
+                    .getResource(new net.minecraft.util.ResourceLocation("shaders/post/entity_outline.json"))
+                    .getInputStream();
+            byte[] buf = new byte[8192];
+            int n, off = 0;
+            while (off < buf.length && (n = in.read(buf, off, buf.length - off)) > 0) {
+                off += n;
+            }
+            String json = new String(buf, 0, off, "UTF-8");
+            return json.contains("entity_blur") ? "patched" : "ORIGINAL(not ours)";
+        } catch (Throwable t) {
+            return "unreadable(" + t.getClass().getSimpleName() + ")";
+        } finally {
+            try {
+                if (in != null) {
+                    in.close();
+                }
+            } catch (java.io.IOException ignored) {
+            }
         }
     }
 
