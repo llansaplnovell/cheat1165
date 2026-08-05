@@ -21,6 +21,7 @@ import javassist.CtClass;
 import javassist.CtMethod;
 import javassist.expr.ExprEditor;
 import javassist.expr.MethodCall;
+import javassist.expr.NewExpr;
 
 public class PatchMagic {
 
@@ -73,6 +74,31 @@ public class PatchMagic {
         // opaque over the whole frame. Force the real state first.
         CtMethod composite = renderGlobal.getDeclaredMethod("renderEntityOutlineFramebuffer");
         composite.insertBefore(ESP + ".forceOutlineBlend();");
+
+        // Load the outline chain from our own resource names.
+        //
+        // The stock path, shaders/post/entity_outline.json, resolves to
+        // something other than this jar in the field — confirmed at runtime by
+        // reading it back through the game's own resource manager, which
+        // returned a copy without our edits. FallbackResourceManager lets the
+        // last resource pack win, and the classpath can hold another jar with
+        // the same asset, so patching those files in place is not reliable.
+        // Whatever shadows them, it does not know these names.
+        //
+        // The shaders behind them are the stock ones. The copies that were
+        // being loaded force alpha to 1.0 in blur and blit, which makes the
+        // outline buffer fully opaque, so compositing it replaces the frame
+        // instead of blending onto it — the black world with flat silhouettes.
+        CtMethod makeShader = renderGlobal.getDeclaredMethod("makeEntityOutlineShader");
+        makeShader.instrument(new ExprEditor() {
+            @Override
+            public void edit(NewExpr expr) throws CannotCompileException {
+                if (!"net.minecraft.util.ResourceLocation".equals(expr.getClassName())) {
+                    return;
+                }
+                expr.replace("{ $_ = new net.minecraft.util.ResourceLocation(\"shaders/post/magic_esp_outline.json\"); }");
+            }
+        });
 
         renderGlobal.writeFile(outDir);
         System.out.println("Patched RenderGlobal.isRenderEntityOutlines() + renderEntityOutlineFramebuffer()");

@@ -295,7 +295,7 @@ public class PlayerESP extends Module {
         java.io.InputStream in = null;
         try {
             in = Minecraft.getMinecraft().getResourceManager()
-                    .getResource(new net.minecraft.util.ResourceLocation("shaders/post/entity_outline.json"))
+                    .getResource(new net.minecraft.util.ResourceLocation("shaders/post/magic_esp_outline.json"))
                     .getInputStream();
             byte[] buf = new byte[8192];
             int n, off = 0;
@@ -303,7 +303,7 @@ public class PlayerESP extends Module {
                 off += n;
             }
             String json = new String(buf, 0, off, "UTF-8");
-            return json.contains("entity_blur") ? "patched" : "ORIGINAL(not ours)";
+            return json.contains("magic_esp_blur") ? "ours" : "NOT-OURS";
         } catch (Throwable t) {
             return "unreadable(" + t.getClass().getSimpleName() + ")";
         } finally {

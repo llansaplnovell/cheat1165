@@ -5,12 +5,12 @@
     ],
     "passes": [
         {
-            "name": "entity_outline",
+            "name": "magic_esp_edge",
             "intarget": "final",
             "outtarget": "swap"
         },
         {
-            "name": "entity_blur",
+            "name": "magic_esp_blur",
             "intarget": "swap",
             "outtarget": "final",
             "uniforms": [
@@ -25,7 +25,7 @@
             ]
         },
         {
-            "name": "entity_blur",
+            "name": "magic_esp_blur",
             "intarget": "final",
             "outtarget": "swap",
             "uniforms": [
@@ -40,7 +40,7 @@
             ]
         },
         {
-            "name": "entity_blit",
+            "name": "magic_esp_blit",
             "intarget": "swap",
             "outtarget": "final"
         }
