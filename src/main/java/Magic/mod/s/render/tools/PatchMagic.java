@@ -61,11 +61,12 @@ public class PatchMagic {
     private static void patchRenderGlobal(ClassPool pool, String outDir) throws Exception {
         CtClass renderGlobal = pool.get("net.minecraft.client.renderer.RenderGlobal");
         CtMethod method = renderGlobal.getDeclaredMethod("isRenderEntityOutlines");
+        // The two private fields are passed in rather than tested here, so the
+        // module side can report which precondition failed instead of the mode
+        // just doing nothing. The OptiFine guard lives on that side too now.
         method.insertBefore(
-                "if (!optifine.Config.isFastRender() && !optifine.Config.isShaders()"
-                        + " && !optifine.Config.isAntialiasing()"
-                        + " && this.entityOutlineFramebuffer != null && this.entityOutlineShader != null"
-                        + " && " + ESP + ".wantsVanillaOutline()) { return true; }");
+                "if (" + ESP + ".vanillaOutlineHook(this.entityOutlineFramebuffer != null,"
+                        + " this.entityOutlineShader != null)) { return true; }");
         renderGlobal.writeFile(outDir);
         System.out.println("Patched RenderGlobal.isRenderEntityOutlines()");
     }

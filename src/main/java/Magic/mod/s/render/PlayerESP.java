@@ -194,15 +194,42 @@ public class PlayerESP extends Module {
         return null;
     }
 
+    /**
+     * Minecraft mode rides vanilla's entity-outline post pass, which has four
+     * independent preconditions, any of which silently disables it. Rather
+     * than guess, report all of them, and try to build the shader first in
+     * case it simply was never created (makeEntityOutlineShader is public and
+     * idempotent — startGame calls it once, before any resource reload).
+     */
     private void warnIfVanillaOutlineBlocked() {
         try {
             if (!this.isEnabled() || this.mode.getValue() != Mode.Minecraft) {
                 return;
             }
+            Minecraft mc = Minecraft.getMinecraft();
+            if (!sawShader || !sawFramebuffer) {
+                try {
+                    mc.renderGlobal.makeEntityOutlineShader();
+                } catch (Throwable ignored) {
+                }
+            }
             String blocker = vanillaOutlineBlocker();
-            if (blocker != null) {
+            if (!OpenGlHelper.shadersSupported) {
+                ClientUtils.debug("PlayerESP: Minecraft mode needs shader support, which this "
+                        + "driver reports as unavailable. Use Outline instead.");
+            } else if (!mc.gameSettings.fboEnable) {
+                ClientUtils.debug("PlayerESP: Minecraft mode needs FBOs — enable them in "
+                        + "Video Settings, or use Outline instead.");
+            } else if (blocker != null) {
                 ClientUtils.debug("PlayerESP: Minecraft mode is unavailable while OptiFine "
                         + blocker + " is on — turn it off, or use Outline instead.");
+            } else if (hookRan && (!sawFramebuffer || !sawShader)) {
+                ClientUtils.debug("PlayerESP: Minecraft mode could not build the entity outline "
+                        + "shader (check the log for \"Failed to load shader\"). Use Outline instead.");
+            } else {
+                ClientUtils.debug("PlayerESP: Minecraft mode active (state: shaders=" + OpenGlHelper.shadersSupported
+                        + " fbo=" + mc.gameSettings.fboEnable + " outlineShader=" + sawShader
+                        + " outlineFbo=" + sawFramebuffer + " hookRan=" + hookRan + ").");
             }
         } catch (Throwable ignored) {
         }
@@ -210,13 +237,32 @@ public class PlayerESP extends Module {
 
     // ================= hooks used by the two renderer patches =================
 
+    /** Last framebuffer/shader state seen by the hook, for diagnostics. */
+    private static volatile boolean sawFramebuffer;
+    private static volatile boolean sawShader;
+    private static volatile boolean hookRan;
+
     /**
-     * Called from the patched RenderGlobal.isRenderEntityOutlines().
-     * The caller ANDs this with OptiFine's own compatibility guard and the
-     * framebuffer/shader null-checks — see the header note.
+     * Called from the patched RenderGlobal.isRenderEntityOutlines(), which
+     * passes in its own two private fields. Taking them as arguments instead
+     * of testing them inside the patch means this side can also *report*
+     * which precondition failed — the mode used to fail completely silently.
      */
-    public static boolean wantsVanillaOutline() {
-        return active(Mode.Minecraft) != null;
+    public static boolean vanillaOutlineHook(boolean hasFramebuffer, boolean hasShader) {
+        sawFramebuffer = hasFramebuffer;
+        sawShader = hasShader;
+        hookRan = true;
+        if (active(Mode.Minecraft) == null) {
+            return false;
+        }
+        // Everything downstream of a true return dereferences those two
+        // fields without checking, so a true here without them is an NPE
+        // once per frame inside the render loop.
+        if (!hasFramebuffer || !hasShader) {
+            return false;
+        }
+        // OptiFine's own guard — bypassing it is what blacked out the screen.
+        return vanillaOutlineBlocker() == null;
     }
 
     /**
