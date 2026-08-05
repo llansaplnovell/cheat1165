@@ -7,6 +7,7 @@ import Magic.mod.Category;
 import Magic.mod.Module;
 import Magic.mod.value.values.BoolValue;
 import Magic.mod.value.values.EnumValue;
+import Magic.mod.value.values.NumberValue;
 import Magic.utils.Friend.FriendManager;
 import Magic.utils.math.Timer;
 import Magic.utils.pathfind.astar.AStar;
@@ -37,6 +38,13 @@ public class TpAura extends Module {
     public EnumValue<TpMode> mode = new EnumValue<TpMode>("Mode", this, TpMode.class, "Teleport methods.");
     private BoolValue block = new BoolValue("Block", this, false, "Auto block.");
     private BoolValue debug = new BoolValue("Debug", this, false, "Prints state to chat.");
+    private NumberValue<Integer> vanillaDelay = new NumberValue<Integer>("VanillaDelay", this, 600, 0, 2000, 50,
+            "Delay between hits in Vanilla mode.");
+    private NumberValue<Float> ncpFactor = new NumberValue<Float>("NcpFactor", this, Float.valueOf(2.0f),
+            Float.valueOf(0.1f), Float.valueOf(5.0f), Float.valueOf(0.1f),
+            "Multiplier over the simulated walk time in NCP mode. Lower hits faster and flags more.");
+    private NumberValue<Integer> ncpMinDelay = new NumberValue<Integer>("NcpMinDelay", this, 500, 0, 3000, 50,
+            "Lower bound for the NCP mode delay.");
     private List<EntityLivingBase> targets = new ArrayList<EntityLivingBase>();
     private EntityLivingBase curTar;
     private boolean hit;
@@ -67,14 +75,14 @@ public class TpAura extends Module {
         float delay = 0.0f;
         switch (this.mode.getValue()) {
             case Vanilla: {
-                delay = 600.0f;
+                delay = this.vanillaDelay.getValue().floatValue();
                 break;
             }
             case NCP: {
                 delay = (float) ((double) this.mc.thePlayer.getDistanceToEntity(this.curTar)
-                        / ClientUtils.getBaseMoveSpeed() * 50.0) * 2.0f;
-                if (delay < 500.0f) {
-                    delay = 500.0f;
+                        / ClientUtils.getBaseMoveSpeed() * 50.0) * this.ncpFactor.getValue().floatValue();
+                if (delay < this.ncpMinDelay.getValue().floatValue()) {
+                    delay = this.ncpMinDelay.getValue().floatValue();
                 }
                 event.setCancelPackets(!this.postHit);
                 break;
@@ -173,6 +181,9 @@ public class TpAura extends Module {
 
     public TpAura() {
         super("TpAura", 35, Category.Combat, "Teleport-hit to player.");
+        this.vanillaDelay.setCondition(() -> this.mode.getValue() == TpMode.Vanilla);
+        this.ncpFactor.setCondition(() -> this.mode.getValue() == TpMode.NCP);
+        this.ncpMinDelay.setCondition(() -> this.mode.getValue() == TpMode.NCP);
     }
 
     private void teleport() {
