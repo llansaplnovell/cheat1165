@@ -1,129 +1,152 @@
-# PlayerESP — перенос в Magic (primordial), MC 1.8.9
+# PlayerESP — перенос в Magic (primordial), MC 1.8.x
 
-## FIX: чёрный экран при входе в мир (был баг в первой версии патча)
-Причина: патч `RenderGlobal.isRenderEntityOutlines()` возвращал `true` без
-проверки `entityOutlineFramebuffer != null && entityOutlineShader != null`.
-А код чуть ниже (framebufferRenderExt/framebufferClear/bindFramebuffer)
-считает, что раз метод вернул `true` — эти объекты точно созданы, и
-дёргает их без доп. проверки. Если в билде шейдер/framebuffer ещё не
-инициализированы (`makeEntityOutlineShader()` не отработал/шейдеры
-недоступны) — это NPE **каждый кадр** внутри рендер-лупа = чёрный экран в
-любом мире, если PlayerESP был включён с режимом Minecraft (это
-дефолтный режим — ordinal 0 у `Mode`).
+Дословный перенос PlayerESP из Peter-клиента на API Magic. Все 5 режимов
+`ESPModes` работают. Файлы:
 
-Исправлено: тот же null-check, что в оригинальной ванильной ветке,
-добавлен и в наше условие (см. `tools/PatchRenderGlobal.java`).
+- `src/main/java/Magic/mod/s/render/PlayerESP.java` — сам модуль
+- `src/main/java/Magic/mod/s/render/tools/PatchMagic.java` — патчер двух
+  ванильных классов рендера (standalone-утилита, не часть сборки мода)
 
-Заодно обернул `renderOutline()` (Outline-режим) в try/finally — если
-`renderEntityStatic()` бросит исключение на какой-то редкой сущности,
-`glColorMask(false,...)`/`GL_STENCIL_TEST` больше не останутся навсегда
-сломанными на весь сеанс (это тоже выглядит как "чёрный экран", просто из
-другого места). И обернул сам цикл по игрокам в `onRender3D` в try/catch
-на сущность — общая `BasicEventSystem.fire()` ничего не ловит сама, так
-что один битый игрок раньше мог обрушить остальные модули с
-`EventRender3D` (например NameTags) на этот кадр.
+Модуль регистрировать вручную не нужно — `Modules.loadModules()` сканирует
+`Magic.mod.s.*` по classpath и сам инстанциирует подкласс `Module`.
 
-## Что это
-Дословный перенос PlayerESP из декомпила Peter-клиента (`Ob0110.java` +
-рендер-утилита `Ob0183.java`) на API Magic. Все режимы, все магические
-числа и все особенности выбора цвета — скопированы как есть, а не
-переизобретены. Список конкретных соответствий — в шапке самого файла
-`PlayerESP.java`.
+---
 
-Файл: `src/main/java/Magic/mod/s/render/PlayerESP.java`
+## FIX: чёрный экран (настоящая причина)
 
-## Куда класть
-В реальный проект `Magic`, по тому же package path:
-`src/main/java/Magic/mod/s/render/PlayerESP.java`
+Первая версия патча `RenderGlobal.isRenderEntityOutlines()` возвращала
+`true` безусловно — ровно как у Peter. У Peter так можно, **у него нет
+OptiFine**. В Magic OptiFine специально закрывает этот проход условием
+`!(Config.isFastRender() || isShaders() || isAntialiasing())`, потому что
+он с ними несовместим: код ниже делает
+`mc.getFramebuffer().bindFramebuffer(false)` посреди пайплайна OptiFine —
+экран чёрный.
 
-Регистрировать вручную не нужно — `Modules.loadModules()` сканирует
-`Magic.mod.s.*` по classpath и сам инстанциирует любой конкретный
-подкласс `Module`, который там найдёт.
+Режим `Minecraft` — дефолтный (ordinal 0 у `Mode`), а `CGui.saveNew()`
+сохраняет включённое состояние модуля при выходе. Поэтому, один раз
+включив PlayerESP, чёрный экран получался при **каждом** следующем заходе
+в мир. Промежуточный "фикс" с null-check не помогал — framebuffer и
+shader были не-null, дело было именно в обходе гварда OptiFine.
 
-## UPDATE: Minecraft/Outline на самом деле реализованы (не dead code)
-Я ошибся в первой версии этого файла — проверил только `Ob0110.java` и
-решил, что "Minecraft"/"Outline" ничего не делают. Дозагрузил полный
-деобф-джар и раскодировал строки тем же XOR-подобным алгоритмом, что в
-самом клиенте (`(c + n2 - key[i % len]) & 0xFFFF`), — оказалось, оба
-режима реализованы патчами в ванильных классах рендера, а не в самом
-`Ob0110`:
+Исправлено: гвард OptiFine учитывается и в нашей ветке. Где эффект вообще
+может работать — картинка идентична Peter; где OptiFine его запрещает —
+режим просто ничего не рисует вместо чёрного экрана.
 
-- **"Outline"** пропатчен в `fZ.java` (= `RendererLivingEntity` по MCP-именам
-  Magic) — проверка `PlayerESP.isEnabled() && ESPModes=="Outline"` включает
-  multi-pass рендер через `GL_STENCIL_TEST`: настоящая 3D-модель игрока
-  рисуется несколько раз, создавая цветной силуэт-контур (не плоскую
-  иконку).
-- **"Minecraft"** пропатчен в `ed.java` (= `RenderGlobal`) — условие
-  (строки декодируются в `"ESPModes"`/`"Minecraft"`) добавляет `||` в
-  ванильный `isRenderEntityOutlines()` (используется для spectator-glow),
-  то есть режим просто переиспользует нативный ванильный
-  `entityOutlineFramebuffer`/`entityOutlineShader`
-  (`shaders/post/entity_outline.json`) вместо своей отрисовки.
+---
 
-**Хорошая новость**: `net.minecraft.client.renderer.RenderGlobal` и
-`RendererLivingEntity` в самом Magic (`primordial.jar`) — 100% чистый
-ванильный+Optifine код, ничего не сломано и не пропатчено под это. Вся
-инфраструктура (framebuffer, шейдер, фильтр по `EntityPlayer`, team-color
-тонирование через флаг `renderOutlines`) на месте и рабочая.
+## Где живут Minecraft и Outline
 
-### Как перенёс
-- **"Outline"** — сделал **без патча jar вообще**, чисто в модуле
-  (`renderOutline()`): публичный `RenderManager.renderEntityStatic(...)` +
-  стандартный 2-проходный stencil-silhouette (проход 1 — модель в stencil
-  без цвета через `glColorMask(false,...)`; проход 2 — увеличенная копия с
-  инвертированным stencil-тестом, красится в наш цвет, без depth-test —
-  сквозь стены). Это не байт-в-байт копия `Ob0183`'s GL-вызовов (там не до
-  конца понятен маппинг конкретных `glStencilFunc`/`glStencilOp` констант),
-  а стандартная, проверенная реализация того же эффекта.
-- **"Minecraft"** — единственное место, где реально пришлось патчить
-  скомпилированный класс: `RenderGlobal.isRenderEntityOutlines()` теперь
-  сначала проверяет `PlayerESP.wantsVanillaOutline()` и возвращает `true`,
-  если да — иначе ведёт себя как раньше (ванильное spectator-условие).
-  Патч сделан через **Javassist** (`CtMethod.insertBefore(...)`) — он был
-  прямо в `primordial.jar` как библиотека, так что не пришлось ничего
-  докачивать. Задет только один метод, всё остальное в классе — as-is.
+Оба режима у Peter реализованы **не в модуле**, а патчами ванильных
+классов рендера. Установлено декодированием обфусцированных строк тем же
+алгоритмом, что в самом клиенте (`(c + n2 - key[i % len]) & 0xFFFF`) —
+строки раскодировались в `"ESPModes"` / `"Outline"` / `"Minecraft"`.
 
-### Ограничение, которое стоит знать
-Я не могу запустить сам Minecraft в этой среде, так что зрительно
-подтвердить, что "Outline"-силуэт и "Minecraft"-glow выглядят именно так,
-как надо, я не могу — только то, что байткод компилируется, резолвится и
-логически соответствует описанному механизму. `isRenderEntityOutlines()`
-после патча декомпилируется ровно так, как задумано (см. коммит).
+### Outline → `fZ.java` (= `RendererLivingEntity`)
 
-## Режимы (те же 5 пунктов, что в оригинальном ESPModes)
-- **Corner** — двойная угловая скобка (32 прямоугольника: 8 цветных +
-  24 чёрной обводки), billboard, координаты 1:1 из `Ob0183.ModSpeed(x,y,z,color)`.
-  Позиция интерполированная (partialTicks), как в оригинале.
-- **Box** — проволочный AABB через `drawSelectionBoundingBox`-алгоритм,
-  **без интерполяции** (сырые `posX/posY/posZ`, как в `Ob0110.Ob0186()` —
-  entity.aqZ/ara/arb там читались напрямую). Бокс уже реального хитбокса
-  (0.5 вместо 0.6), depth test всегда выключен — сквозь стены без тумблера,
-  как в источнике.
-- **Other** — простая рамка (4 стороны) белым + один цветной акцентный
-  прямоугольник, тоже billboard, интерполированная позиция.
+Внутри `doRender`, в ветке без `renderOutlines`, сразу после
+`setDoRenderBrightness`, идёт 4-проходный stencil-силуэт:
 
-## Цвета — сохранены оригинальные особенности, а не "исправлены"
-- **Corner**: hurt-flash (`hurtTime>0`) → оранжево-красный, иначе друг →
-  белый, иначе `baseColor`.
+```
+renderModel();  stencilSetup()                 <- Ob0183.ModFullBright()
+renderModel();  stencilFillPass()              <- Ob0183.Ob0033()
+renderModel();  stencilOutlinePass()           <- Ob0183.Ob0272()
+applyOutlineColor(entity); outlineDrawState()  <- Ob0183.Ob0171()
+renderModel();  stencilTeardown()              <- Ob0183.Ob0123()
+renderModel();  // обычный вызов продолжается
+```
+
+Все GL-константы перенесены буквально: `glStencilFunc(512,1,15)` /
+`(512,0,15)` / `(514,1,15)`, `glStencilOp(7681,...)` / `(7680,...)`,
+`glPolygonMode(1032, 6913/6914)`, `glPolygonOffset(1, ∓2000000)`,
+`glPushAttrib(1048575)`, `glLineWidth(2)`, lightmap 240/240.
+
+Важная деталь, упущенная в промежуточной версии: у MC во фреймбуфере
+**нет stencil-буфера**, его надо доцепить (`DEPTH24_STENCIL8`). У Peter
+это `Ob0183.Ob0254()`; в Magic для этого уже есть готовый
+`Magic.utils.render.StencilUtil.checkSetupFBO()` — используется он.
+
+Как у Peter, Outline применяется ко **всем** `EntityLivingBase` кроме
+своего игрока (`entity instanceof nH && entity != f.jF`), а не только к
+игрокам.
+
+Патч сделан не вставкой в середину метода, а переписыванием самого
+call-site `renderModel()` (javassist `ExprEditor`): порядок инструкций и
+все пять отрисовок те же, а гвард `!renderOutlines` воспроизводит
+расположение Peter'а внутри else-ветки (в ветке vanilla-outline
+`renderModel` тоже вызывается и трогать её нельзя).
+
+### Minecraft → `ed.java` (= `RenderGlobal`)
+
+Peter добавляет свою проверку в `isRenderEntityOutlines()`, переиспользуя
+нативный ванильный spectator-glow проход
+(`entityOutlineFramebuffer` / `entityOutlineShader`,
+`shaders/post/entity_outline.json`) вместо собственной отрисовки.
+
+Здесь то же самое, плюс два дополнительных условия (см. FIX выше):
+гвард OptiFine и null-check на framebuffer/shader — всё, что ниже по
+коду, разыменовывает эти поля без проверок.
+
+---
+
+## Режимы, реализованные в самом модуле
+
+- **Corner** — двойная угловая скобка (32 прямоугольника: 8 цветных + 24
+  чёрной обводки), billboard, координаты 1:1 из
+  `Ob0183.ModSpeed(x,y,z,color)`. Позиция интерполированная (partialTicks).
+- **Box** — проволочный AABB, **без интерполяции** (сырые `posX/posY/posZ`,
+  как в `Ob0110.Ob0186()`, где читались `entity.aqZ/ara/arb` напрямую —
+  поэтому слегка дёргается между тиками, это оригинальное поведение).
+  Бокс уже реального хитбокса (0.5 вместо 0.6), depth-test всегда
+  выключен — сквозь стены, тумблера не было.
+- **Other** — рамка (4 стороны) белым + один цветной акцентный
+  прямоугольник, billboard, интерполированная позиция.
+
+## Цвета — сохранены оригинальные особенности, а не «исправлены»
+
+- **Corner**: `hurtTime>0` → оранжево-красный (255,50,10), иначе друг →
+  белый, иначе акцентный цвет клиента.
 - **Box**: в оригинале и friend-, и non-friend-ветка резолвились в один и
-  тот же литерал (белый) — это дословно воспроизведено, не заменено на
-  `baseColor` для non-friend случая.
-- **Other**: вообще не проверяет `FriendManager` (только hurt-flash vs
-  `baseColor`) — в оригинале тоже так.
+  тот же литерал (белый) — воспроизведено как есть.
+- **Other**: `FriendManager` не проверяется вообще (только hurt-flash vs
+  акцентный цвет) — в оригинале тоже так.
+- **Outline**: свой красный (255,**10**,10), отличный от Corner/Other
+  (255,**50**,10) — тоже как в оригинале.
 
-## Единственное место, где пришлось принять решение (не 1:1 проверено)
-Внутри billboard-блока `Ob0183` было два вызова через обфусцированные
-имена (`dT.hG()`, `dT.Ob0091(true)`) сразу после `glDisable(GL_DEPTH_TEST)`.
-Их смысл почти наверняка `disableTexture2D()`/`depthMask(true)` (судя по
-такому же паттерну в других местах того же класса), но 100% не проверено
-рендером — я не могу запустить графический клиент в этой сессии, чтобы
-сверить визуально. На итоговую картинку это не влияет: рисуются сплошные
-непрозрачные прямоугольники без текстуры, `depthMask` при выключенном
-depth test почти ни на что не влияет.
+## Настройки
 
-## Зависимости — всё уже есть в Magic
-`Module`, `Category.Render`, `EnumValue`, `ColorValue`,
-`Magic.ink.event.s.EventRender3D` + `pisi.unitedmeows.eventapi` `Listener`,
-`Magic.utils.Friend.FriendManager.isFriend`, `Magic.utils.player.ClientUtils.getPlayers`,
-плюс ванильные `Gui.drawRect` / `Tessellator` / `WorldRenderer` / `GlStateManager`.
-Ничего докидывать не пришлось.
+Одна, как у Peter: комбо `Mode` (`Minecraft` / `Outline` / `Corner` /
+`Box` / `Other`, порядок оригинальный). Акцентный цвет берётся из клиента
+(`Magic.getClientColor()` — аналог `Ob0106.Ob0219()`), отдельной
+настройки цвета у оригинала не было.
+
+---
+
+## Как пересобрать
+
+```bash
+# 1) распаковать jar
+unzip -q primordial.jar -d classes && rm -f classes/module-info.class
+
+# 2) собрать модуль
+javac -cp classes -d classes PlayerESP.java
+
+# 3) применить оба патча (javassist уже лежит внутри primordial.jar)
+javac -cp classes -d . tools/PatchMagic.java
+java  -cp .:classes PatchMagic classes out
+
+# 4) вложить обратно
+jar uf primordial.jar -C classes Magic/mod/s/render/PlayerESP.class
+jar uf primordial.jar -C classes 'Magic/mod/s/render/PlayerESP$Mode.class'
+jar uf primordial.jar -C out net/minecraft/client/renderer/RenderGlobal.class
+jar uf primordial.jar -C out net/minecraft/client/renderer/entity/RendererLivingEntity.class
+```
+
+## Что проверено, а что нет
+
+Проверено: обе вставки декомпилируются ровно в ожидаемый код; все три
+класса грузятся и линкуются под `-Xverify:all` (не VerifyError);
+структура zip и манифест (`Main-Class: Start`) целы.
+
+Не проверено: как оно выглядит в живой игре — графического клиента в
+среде сборки нет. Визуальную корректность силуэта и glow подтвердить
+могу только логикой соответствия оригиналу, не глазами.

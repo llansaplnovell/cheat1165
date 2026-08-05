@@ -1,90 +1,84 @@
 /*
- * PlayerESP for Magic (aka "primordial") — MC 1.8.9
+ * PlayerESP for Magic (aka "primordial") — MC 1.8.x
  *
- * Faithful port of the Peter-client PlayerESP (Ob0110.java + Ob0183.java
- * render helpers, decompiled/deobfuscated). This is a literal translation
- * of that logic onto Magic's own APIs (Module/Category/EnumValue/BoolValue/
- * ColorValue, EventRender3D via pisi.unitedmeows.eventapi Listener,
- * FriendManager) — not a reinterpretation. Every mode, every magic number
- * and every color-selection quirk from the original is reproduced on
- * purpose; see the per-mode notes below for exactly what was kept as-is.
+ * Faithful port of the Peter-client PlayerESP. All five ESPModes are
+ * reproduced, including the two that are NOT implemented inside the module
+ * itself. Source mapping (Peter -> here):
  *
- * Drop this file into: src/main/java/Magic/mod/s/render/PlayerESP.java
- * of the real Magic project tree. Modules.loadModules() scans
- * Magic.mod.s.* on the classpath and instantiates it automatically —
- * no manual registration needed.
+ *   Ob0110               -> this class (the PlayerESP module)
+ *   Ob0110.Ob0216()       -> onRender3D listener body (Corner/Box/Other)
+ *   Ob0110.Ob0186()       -> drawBox()          (Box mode)
+ *   Ob0183.ModSpeed(x,y,z,color)        -> drawCornerBadge()  (Corner mode)
+ *   Ob0183.ModSpeed(x,y,z,color,color2) -> drawOtherBadge()   (Other mode)
+ *   Ob0183.ModSpeed(dX,dY,dW,dH,color)  -> border()
+ *   Ob0183.ModFullBright()-> stencilSetup()      \
+ *   Ob0183.Ob0033()       -> stencilFillPass()    | Outline mode, driven by
+ *   Ob0183.Ob0272()       -> stencilOutlinePass() | the RendererLivingEntity
+ *   Ob0183.Ob0171()       -> outlineDrawState()   | patch (see below)
+ *   Ob0183.Ob0123()       -> stencilTeardown()   /
+ *   Ob0183.Ob0254()       -> StencilUtil.checkSetupFBO() (Magic already has
+ *                            this exact helper — same DEPTH24_STENCIL8
+ *                            renderbuffer re-attach Peter's Ob0254 did)
+ *   entity.atq            -> EntityLivingBase.hurtTime
+ *   entity.rx()           -> EntityLivingBase.isEntityAlive()
+ *   Ob0106.Ob0219()       -> Magic.getClientColor()  (client accent color)
+ *   Ob0115.Ob0263()       -> FriendManager.isFriend()
  *
- * Source mapping (Peter -> here):
- *   Ob0110              -> this class (the PlayerESP module itself)
- *   Ob0110.Ob0216()      -> onRender3D listener body
- *   Ob0110.Ob0186()      -> drawBox() (Box mode)
- *   Ob0183.ModSpeed(x,y,z,color)         -> drawCornerBadge()  (Corner mode)
- *   Ob0183.ModSpeed(x,y,z,color,color2)  -> drawOtherBadge()   (Other mode)
- *   Ob0183.ModSpeed(drawX,drawY,drawW,drawH,color) -> border()
- *   Ob0183's underlying (double,double,double,double,int) rect primitive
- *     resolves to the vanilla Gui.drawRect(left,top,right,bottom,color)
- *     algorithm (same disableTexture/blend/tessellator quad sequence) —
- *     so it's called directly here instead of re-implementing it.
- *   entity.atq  -> EntityLivingBase.hurtTime (public vanilla field)
- *   entity.rx() -> EntityLivingBase.isEntityAlive()
- *   Ob0106.Ob0219() (client accent color) -> baseColor ColorValue
- *   Ob0115.Ob0263()  -> FriendManager.isFriend()
+ * WHERE THE TWO NON-MODULE MODES LIVE
+ * -----------------------------------
+ * Peter implements "Outline" and "Minecraft" by patching vanilla renderer
+ * classes, not in Ob0110. Both patches are reproduced by tools/PatchMagic.java:
  *
- * "Minecraft" and "Outline" were NOT dead code in the original, unlike I
- * first assumed from only reading Ob0110.java — they're implemented by
- * patching vanilla renderer classes directly, outside the PlayerESP
- * module's own draw method:
+ *   - "Outline"  -> fZ.java (= RendererLivingEntity here). Inside doRender's
+ *     non-renderOutlines branch, right after setDoRenderBrightness, a
+ *     4-pass GL_STENCIL_TEST silhouette is drawn around the real model:
+ *         renderModel(); stencilSetup();
+ *         renderModel(); stencilFillPass();
+ *         renderModel(); stencilOutlinePass();
+ *         applyOutlineColor(); outlineDrawState();
+ *         renderModel(); stencilTeardown();
+ *     then the normal renderModel() call proceeds. 1:1 with Peter, including
+ *     that it covers every EntityLivingBase except your own player (Peter
+ *     checks `entity instanceof nH && entity != f.jF`, not "is a player").
  *
- *   - "Outline" is patched into fZ.java (RendererLivingEntity in Magic's
- *     MCP names): PlayerESP.isEnabled() && ESPModes=="Outline" gates a
- *     multi-pass GL_STENCIL_TEST silhouette render of the real 3D model
- *     (confirmed by decoding the obfuscated string-decrypt calls with the
- *     exact same char-shift algorithm used throughout that codebase —
- *     decodes to "ESPModes"/"Outline").
- *   - "Minecraft" is patched into ed.java (RenderGlobal): a method
- *     (decoded strings: "ESPModes"/"Minecraft") ORs into vanilla's own
- *     isRenderEntityOutlines() spectator-glow gate, reusing Minecraft's
- *     native entityOutlineFramebuffer/entityOutlineShader post-process
- *     pass (shaders/post/entity_outline.json) instead of a custom draw.
+ *   - "Minecraft" -> ed.java (= RenderGlobal here). Peter ORs his check into
+ *     isRenderEntityOutlines(), reusing vanilla's own spectator-glow pass
+ *     (entityOutlineFramebuffer/entityOutlineShader, driven by
+ *     shaders/post/entity_outline.json) instead of drawing anything itself.
  *
- * Magic's own net.minecraft.client.renderer.RenderGlobal /
- * RendererLivingEntity are still 100% stock — that whole vanilla
- * spectator-outline pipeline (framebuffer, shader, EntityPlayer-only
- * filtering, per-entity team-color tint via the `renderOutlines` flag)
- * is intact and unpatched. Two ways to reach the same effect here:
- *
- *   - "Outline" is done below in pure module code (renderOutline()), via
- *     the public RenderManager.renderEntityStatic() API + a standard
- *     2-pass stencil-silhouette technique. This reproduces the same
- *     *effect* as Peter's stencil calls, but isn't a byte-for-byte mirror
- *     of them — I don't have a fully confirmed mapping for Ob0183's exact
- *     glStencilFunc/glStencilOp constants the way I do for Corner/Box/
- *     Other, so this is a from-scratch (but standard, well-understood)
- *     implementation of the same silhouette-outline algorithm.
- *   - "Minecraft" genuinely needs one small patch to Magic's own compiled
- *     RenderGlobal.class: isRenderEntityOutlines() has to also return
- *     true when wantsVanillaOutline() (below) is true. That one method is
- *     the only piece I can't add by just dropping in a new .java file —
- *     it requires a targeted bytecode patch (e.g. via Javassist) to the
- *     already-compiled vanilla class, the same category of change Peter's
- *     jar has baked in. See PLAYERESP_NOTES.md for the exact patch.
+ * THE ONE DELIBERATE DIFFERENCE FROM PETER (and why)
+ * --------------------------------------------------
+ * Peter's isRenderEntityOutlines() equivalent returns true *unconditionally*
+ * for Minecraft mode. His client has no OptiFine, so that is safe there.
+ * Magic ships OptiFine, whose isRenderEntityOutlines() carries an extra
+ * guard — !(Config.isFastRender() || isShaders() || isAntialiasing()) —
+ * precisely because that framebuffer pass is incompatible with those
+ * features: forcing it on rebinds mc.getFramebuffer() mid-pipeline and the
+ * screen goes black. So the patch here keeps OptiFine's guard instead of
+ * bypassing it. Same visual result wherever the effect can legally run,
+ * and it degrades to "mode does nothing" instead of a black screen when
+ * FastRender/Shaders/AA are on.
  */
 package Magic.mod.s.render;
 
+import Magic.Magic;
 import Magic.ink.event.s.EventRender3D;
 import Magic.mod.Category;
 import Magic.mod.Module;
 import Magic.mod.Modules;
-import Magic.mod.value.values.ColorValue;
 import Magic.mod.value.values.EnumValue;
 import Magic.utils.Friend.FriendManager;
 import Magic.utils.player.ClientUtils;
+import Magic.utils.render.StencilUtil;
 import java.awt.Color;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Gui;
 import net.minecraft.client.renderer.GlStateManager;
+import net.minecraft.client.renderer.OpenGlHelper;
 import net.minecraft.client.renderer.Tessellator;
 import net.minecraft.client.renderer.WorldRenderer;
 import net.minecraft.client.renderer.vertex.DefaultVertexFormats;
+import net.minecraft.entity.EntityLivingBase;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.util.AxisAlignedBB;
 import org.lwjgl.opengl.GL11;
@@ -92,22 +86,23 @@ import pisi.unitedmeows.eventapi.event.listener.Listener;
 
 public class PlayerESP extends Module {
 
-    /** Same five options as the original ESPModes combo, same order. */
+    /** Peter's PlayerESP had exactly one setting: the ESPModes combo. */
     private final EnumValue<Mode> mode = new EnumValue<Mode>("Mode", this, Mode.class, "ESP render style.");
-    private final ColorValue baseColor = new ColorValue("Color", this, new Color(255, 60, 60), "Client-accent replacement (was Ob0106.Ob0219()).");
 
     private static final Color HURT_COLOR = new Color(255, 50, 10, 255);
     private static final Color FRIEND_COLOR = new Color(255, 255, 255, 255);
+    /** Outline mode uses its own, slightly different red — as in the original. */
+    private static final Color OUTLINE_HURT_COLOR = new Color(255, 10, 10, 255);
+    private static final Color OUTLINE_COLOR = new Color(255, 255, 255, 255);
 
     private final Listener<EventRender3D> onRender3D = new Listener<EventRender3D>(event -> {
         if (this.mc.theWorld == null || this.mc.thePlayer == null) {
             return;
         }
         Mode m = this.mode.getValue();
-        // "Minecraft" draws nothing here — it works by making vanilla's own
-        // RenderGlobal.isRenderEntityOutlines() return true (see
-        // wantsVanillaOutline() + PLAYERESP_NOTES.md), not via a draw call.
-        if (m == Mode.Minecraft) {
+        // Minecraft and Outline draw nothing from here — they're driven by the
+        // RenderGlobal / RendererLivingEntity patches, exactly as in Peter.
+        if (m != Mode.Corner && m != Mode.Box && m != Mode.Other) {
             return;
         }
         float partialTicks = event.partialTicks();
@@ -116,16 +111,12 @@ public class PlayerESP extends Module {
                 if (player == this.mc.thePlayer || player.isDead || !player.isEntityAlive()) {
                     continue;
                 }
-                // Caught per-entity on purpose: this fires on the shared
-                // BasicEventSystem, which doesn't guard listener.call() at
-                // all — one bad entity throwing here could otherwise take
-                // down every other module's EventRender3D listener (e.g.
-                // NameTags) for the rest of that frame, not just this one.
+                // Caught per-entity: this runs on the shared BasicEventSystem,
+                // which doesn't guard listener.call() at all, so an throw here
+                // would take down every other module's EventRender3D listener
+                // (NameTags etc.) for the rest of the frame, not just ours.
                 try {
                     switch (m) {
-                        case Outline:
-                            this.renderOutline(player, partialTicks);
-                            break;
                         case Corner:
                             this.renderCorner(player, partialTicks);
                             break;
@@ -145,19 +136,8 @@ public class PlayerESP extends Module {
         }
     });
 
-    /**
-     * Called from the small patch to RenderGlobal.isRenderEntityOutlines()
-     * (see PLAYERESP_NOTES.md) — lets "Minecraft" mode reuse vanilla's own
-     * entityOutlineFramebuffer/entityOutlineShader spectator-glow pass
-     * instead of a custom draw call, exactly like the original did.
-     */
-    public static boolean wantsVanillaOutline() {
-        PlayerESP module = Modules.get(PlayerESP.class);
-        return module != null && module.isEnabled() && module.mode.getValue() == Mode.Minecraft;
-    }
-
     public PlayerESP() {
-        super("PlayerESP", 0, Category.Render, "Highlights other players (Corner/Box/Other, ported from Peter's PlayerESP).");
+        super("PlayerESP", 0, Category.Render, "Highlights players (Minecraft/Outline/Corner/Box/Other).");
     }
 
     @Override
@@ -166,13 +146,113 @@ public class PlayerESP extends Module {
         super.onSuffixChange();
     }
 
-    // ---- Corner mode : Ob0110's "Corner" branch + Ob0183.ModSpeed(x,y,z,color) ----
-    // Friend -> white, hurt flash -> orange-red, else baseColor. Uses the
-    // *interpolated* render position (matches tickX/tickY/tickZ in the source).
+    private static PlayerESP active(Mode wanted) {
+        try {
+            PlayerESP module = Modules.get(PlayerESP.class);
+            if (module != null && module.isEnabled() && module.mode.getValue() == wanted) {
+                return module;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    // ================= hooks used by the two renderer patches =================
+
+    /**
+     * Called from the patched RenderGlobal.isRenderEntityOutlines().
+     * The caller ANDs this with OptiFine's own compatibility guard and the
+     * framebuffer/shader null-checks — see the header note.
+     */
+    public static boolean wantsVanillaOutline() {
+        return active(Mode.Minecraft) != null;
+    }
+
+    /**
+     * Called from the patched RendererLivingEntity.doRender().
+     * Mirrors Peter's `entity instanceof nH && entity != f.jF` — every living
+     * entity except your own player, not only players.
+     */
+    public static boolean wantsStencilOutline(EntityLivingBase entity) {
+        if (entity == null || active(Mode.Outline) == null) {
+            return false;
+        }
+        return entity != Minecraft.getMinecraft().thePlayer;
+    }
+
+    // ---- Ob0183.ModFullBright() ----
+    public static void stencilSetup() {
+        StencilUtil.checkSetupFBO(Minecraft.getMinecraft().getFramebuffer()); // Ob0254
+        GL11.glPushAttrib(1048575);             // GL_ALL_ATTRIB_BITS
+        GL11.glDisable(3008);                   // GL_ALPHA_TEST
+        GL11.glDisable(3553);                   // GL_TEXTURE_2D
+        GL11.glDisable(2896);                   // GL_LIGHTING
+        GL11.glEnable(3042);                    // GL_BLEND
+        GL11.glBlendFunc(770, 771);
+        GL11.glLineWidth(2.0f);
+        GL11.glEnable(2848);                    // GL_LINE_SMOOTH
+        GL11.glEnable(2960);                    // GL_STENCIL_TEST
+        GL11.glClear(1024);                     // GL_STENCIL_BUFFER_BIT
+        GL11.glClearStencil(15);
+        GL11.glStencilFunc(512, 1, 15);         // GL_NEVER, ref 1
+        GL11.glStencilOp(7681, 7681, 7681);     // GL_REPLACE
+        GL11.glPolygonMode(1032, 6913);         // GL_FRONT_AND_BACK, GL_LINE
+    }
+
+    // ---- Ob0183.Ob0033() ----
+    public static void stencilFillPass() {
+        GL11.glStencilFunc(512, 0, 15);         // GL_NEVER, ref 0
+        GL11.glStencilOp(7681, 7681, 7681);     // GL_REPLACE
+        GL11.glPolygonMode(1032, 6914);         // GL_FILL
+    }
+
+    // ---- Ob0183.Ob0272() ----
+    public static void stencilOutlinePass() {
+        GL11.glStencilFunc(514, 1, 15);         // GL_EQUAL, ref 1
+        GL11.glStencilOp(7680, 7680, 7680);     // GL_KEEP
+        GL11.glPolygonMode(1032, 6913);         // GL_LINE
+    }
+
+    /** Peter: hurtTime > 0 ? rgba(255,10,10) : white. Note the 10 vs Corner's 50. */
+    public static void applyOutlineColor(EntityLivingBase entity) {
+        Color color = entity != null && entity.hurtTime > 0 ? OUTLINE_HURT_COLOR : OUTLINE_COLOR;
+        GL11.glColor4d((double) color.getRed() / 255.0, (double) color.getGreen() / 255.0,
+                (double) color.getBlue() / 255.0, (double) color.getAlpha() / 255.0);
+    }
+
+    // ---- Ob0183.Ob0171() ----
+    public static void outlineDrawState() {
+        GL11.glDepthMask(false);
+        GL11.glDisable(2929);                   // GL_DEPTH_TEST
+        GL11.glEnable(10754);                   // GL_POLYGON_OFFSET_LINE
+        GL11.glPolygonOffset(1.0f, -2000000.0f);
+        OpenGlHelper.setLightmapTextureCoords(OpenGlHelper.lightmapTexUnit, 240.0f, 240.0f);
+    }
+
+    // ---- Ob0183.Ob0123() ----
+    public static void stencilTeardown() {
+        GL11.glPolygonOffset(1.0f, 2000000.0f);
+        GL11.glDisable(10754);                  // GL_POLYGON_OFFSET_LINE
+        GL11.glEnable(2929);                    // GL_DEPTH_TEST
+        GL11.glDepthMask(true);
+        GL11.glDisable(2960);                   // GL_STENCIL_TEST
+        GL11.glDisable(2848);                   // GL_LINE_SMOOTH
+        GL11.glHint(3154, 4352);                // GL_LINE_SMOOTH_HINT, GL_DONT_CARE
+        GL11.glEnable(3042);                    // GL_BLEND
+        GL11.glEnable(2896);                    // GL_LIGHTING
+        GL11.glEnable(3553);                    // GL_TEXTURE_2D
+        GL11.glEnable(3008);                    // GL_ALPHA_TEST
+        GL11.glPopAttrib();
+    }
+
+    // ============================ module-side modes ============================
+
+    // ---- Corner mode : Ob0110's "Corner" branch ----
+    // Friend -> white, hurt flash -> orange-red, else the client accent color.
+    // Uses the interpolated render position (tickX/tickY/tickZ in the source).
     private void renderCorner(EntityPlayer player, float partialTicks) {
         double[] pos = this.interpolatedRenderPos(player, partialTicks);
-        int color = this.cornerColor(player).getRGB();
-        this.drawCornerBadge(pos[0], pos[1], pos[2], color);
+        this.drawCornerBadge(pos[0], pos[1], pos[2], this.cornerColor(player).getRGB());
     }
 
     private Color cornerColor(EntityPlayer player) {
@@ -182,98 +262,32 @@ public class PlayerESP extends Module {
         if (FriendManager.isFriend(player.getName())) {
             return FRIEND_COLOR;
         }
-        return this.baseColor.getValue();
+        return Magic.getClientColor();
     }
 
     // ---- Box mode : Ob0110.Ob0186() ----
-    // Uses the entity's RAW (non-interpolated) position, same as the
-    // original — Box literally reads entity.aqZ/ara/arb directly instead of
-    // lastTickPos+partialTicks, so unlike Corner/Other it will jitter a
-    // little between ticks. That's a straight port of that behavior, not a
-    // bug I introduced. Box is a narrower box than the real hitbox
-    // (0.5 wide instead of the player's 0.6) — also as in the source.
-    // NOTE: in the original, both the friend and non-friend branch of Box
-    // resolved to the same literal white color (Ob0115.Ob0263(...) ? white :
-    // white) — reproduced as-is below instead of "fixing" it to use
-    // baseColor, since the ask this time is a faithful port.
+    // Uses the entity's RAW (non-interpolated) position, same as the original —
+    // Box reads entity.aqZ/ara/arb directly rather than lastTickPos+partialTicks,
+    // so unlike Corner/Other it jitters slightly between ticks. Straight port,
+    // not a bug introduced here. The box is also narrower than the real hitbox
+    // (0.5 vs the player's 0.6), also as in the source. And in the original both
+    // the friend and non-friend branch resolved to the same literal white
+    // (isFriend ? white : white) — reproduced rather than "fixed".
     private void renderBox(EntityPlayer player) {
         double x = player.posX - 0.5 - this.mc.getRenderManager().renderPosX;
         double y = player.posY - this.mc.getRenderManager().renderPosY;
         double z = player.posZ - 0.5 - this.mc.getRenderManager().renderPosZ;
         AxisAlignedBB box = new AxisAlignedBB(x + 0.3, y, z + 0.3, x + 0.8, y + 1.9, z + 0.8);
-        Color color = player.hurtTime > 0 ? HURT_COLOR : FRIEND_COLOR;
-        this.drawBox(box, color);
+        this.drawBox(box, player.hurtTime > 0 ? HURT_COLOR : FRIEND_COLOR);
     }
 
-    // ---- Other mode : Ob0110's "Other" branch + Ob0183.ModSpeed(x,y,z,color,color2) ----
-    // Note this branch never checked FriendManager in the original either —
-    // only hurt-flash vs. baseColor. Kept exactly that way.
+    // ---- Other mode : Ob0110's "Other" branch ----
+    // This branch never consulted FriendManager in the original either — only
+    // hurt-flash vs. the accent color. Kept exactly that way.
     private void renderOther(EntityPlayer player, float partialTicks) {
         double[] pos = this.interpolatedRenderPos(player, partialTicks);
-        int accent = (player.hurtTime > 0 ? HURT_COLOR : this.baseColor.getValue()).getRGB();
+        int accent = (player.hurtTime > 0 ? HURT_COLOR : Magic.getClientColor()).getRGB();
         this.drawOtherBadge(pos[0], pos[1], pos[2], -1, accent);
-    }
-
-    // ---- Outline mode : reproduces the fZ.java multi-pass GL_STENCIL_TEST
-    // silhouette effect using only public vanilla API, since Magic's own
-    // RendererLivingEntity hasn't been patched the way Peter's fZ.java was
-    // (see the class-level notes above and PLAYERESP_NOTES.md). Pass 1
-    // renders the real model into the stencil buffer only (color writes
-    // masked off); pass 2 renders a slightly enlarged copy with the
-    // stencil test inverted, so only the outline fringe outside the
-    // original silhouette gets drawn, in our color, with depth test off
-    // (through walls, same as every other mode here). ----
-    // NOTE: wrapped in try/finally on purpose — if renderEntityStatic() ever
-    // throws for some edge-case entity (missing skin, mid-despawn, whatever),
-    // an unguarded colorMask(false,false,false,false) or a left-on
-    // GL_STENCIL_TEST would silently break *all* rendering for the rest of
-    // the session (looks exactly like a black screen). Every bit of GL
-    // state this method touches is restored in the finally blocks below,
-    // no matter what happens in between.
-    private void renderOutline(EntityPlayer player, float partialTicks) {
-        Color color = player.hurtTime > 0 ? HURT_COLOR
-                : FriendManager.isFriend(player.getName()) ? FRIEND_COLOR
-                : this.baseColor.getValue();
-        double[] pos = this.interpolatedRenderPos(player, partialTicks);
-
-        GlStateManager.pushMatrix();
-        try {
-            GL11.glEnable(GL11.GL_STENCIL_TEST);
-            GL11.glClear(GL11.GL_STENCIL_BUFFER_BIT);
-            GlStateManager.disableDepth();
-
-            GL11.glColorMask(false, false, false, false);
-            try {
-                GL11.glStencilFunc(GL11.GL_ALWAYS, 1, 0xFF);
-                GL11.glStencilOp(GL11.GL_REPLACE, GL11.GL_REPLACE, GL11.GL_REPLACE);
-                this.mc.getRenderManager().renderEntityStatic(player, partialTicks, false);
-            } finally {
-                GL11.glColorMask(true, true, true, true);
-            }
-
-            GL11.glStencilFunc(GL11.GL_NOTEQUAL, 1, 0xFF);
-            GL11.glStencilOp(GL11.GL_KEEP, GL11.GL_KEEP, GL11.GL_KEEP);
-            GlStateManager.disableTexture2D();
-            GlStateManager.disableLighting();
-            GlStateManager.color((float) color.getRed() / 255.0f, (float) color.getGreen() / 255.0f, (float) color.getBlue() / 255.0f, 1.0f);
-            double pivotY = pos[1] + player.height / 2.0;
-            GlStateManager.pushMatrix();
-            try {
-                GlStateManager.translate(pos[0], pivotY, pos[2]);
-                GlStateManager.scale(1.06f, 1.06f, 1.06f);
-                GlStateManager.translate(-pos[0], -pivotY, -pos[2]);
-                this.mc.getRenderManager().renderEntityStatic(player, partialTicks, false);
-            } finally {
-                GlStateManager.popMatrix();
-            }
-        } finally {
-            GlStateManager.enableTexture2D();
-            GlStateManager.enableLighting();
-            GL11.glDisable(GL11.GL_STENCIL_TEST);
-            GlStateManager.enableDepth();
-            GlStateManager.color(1.0f, 1.0f, 1.0f, 1.0f);
-            GlStateManager.popMatrix();
-        }
     }
 
     private double[] interpolatedRenderPos(EntityPlayer player, float partialTicks) {
@@ -283,58 +297,59 @@ public class PlayerESP extends Module {
         return new double[]{x, y, z};
     }
 
-    // ---- Box wireframe : Ob0110.Ob0186() drawing half, i.e. the vanilla
-    // RenderGlobal.drawSelectionBoundingBox algorithm the original called
-    // through ed.Ob0151(new vr(...)). Depth test is unconditionally disabled
-    // here, exactly like the source — Box always renders through terrain,
-    // there was no toggle for it. ----
+    // ---- Box wireframe : the drawing half of Ob0110.Ob0186(), i.e. the vanilla
+    // RenderGlobal.drawSelectionBoundingBox algorithm it reached through
+    // ed.Ob0151(new vr(...)). Depth test is unconditionally off, exactly like
+    // the source — Box always renders through terrain, there was no toggle. ----
     private void drawBox(AxisAlignedBB bb, Color color) {
         GlStateManager.pushMatrix();
-        GlStateManager.enableBlend();
-        GlStateManager.tryBlendFuncSeparate(770, 771, 1, 0);
-        GlStateManager.disableTexture2D();
-        GlStateManager.disableDepth();
-        GlStateManager.depthMask(true);
-        GL11.glLineWidth(1.0f);
-        GlStateManager.color((float) color.getRed() / 255.0f, (float) color.getGreen() / 255.0f, (float) color.getBlue() / 255.0f, 1.0f);
-        Tessellator tessellator = Tessellator.getInstance();
-        WorldRenderer wr = tessellator.getWorldRenderer();
-        wr.begin(3, DefaultVertexFormats.POSITION);
-        wr.pos(bb.minX, bb.minY, bb.minZ).endVertex();
-        wr.pos(bb.maxX, bb.minY, bb.minZ).endVertex();
-        wr.pos(bb.maxX, bb.minY, bb.maxZ).endVertex();
-        wr.pos(bb.minX, bb.minY, bb.maxZ).endVertex();
-        wr.pos(bb.minX, bb.minY, bb.minZ).endVertex();
-        tessellator.draw();
-        wr.begin(3, DefaultVertexFormats.POSITION);
-        wr.pos(bb.minX, bb.maxY, bb.minZ).endVertex();
-        wr.pos(bb.maxX, bb.maxY, bb.minZ).endVertex();
-        wr.pos(bb.maxX, bb.maxY, bb.maxZ).endVertex();
-        wr.pos(bb.minX, bb.maxY, bb.maxZ).endVertex();
-        wr.pos(bb.minX, bb.maxY, bb.minZ).endVertex();
-        tessellator.draw();
-        wr.begin(1, DefaultVertexFormats.POSITION);
-        wr.pos(bb.minX, bb.minY, bb.minZ).endVertex();
-        wr.pos(bb.minX, bb.maxY, bb.minZ).endVertex();
-        wr.pos(bb.maxX, bb.minY, bb.minZ).endVertex();
-        wr.pos(bb.maxX, bb.maxY, bb.minZ).endVertex();
-        wr.pos(bb.maxX, bb.minY, bb.maxZ).endVertex();
-        wr.pos(bb.maxX, bb.maxY, bb.maxZ).endVertex();
-        wr.pos(bb.minX, bb.minY, bb.maxZ).endVertex();
-        wr.pos(bb.minX, bb.maxY, bb.maxZ).endVertex();
-        tessellator.draw();
-        GlStateManager.depthMask(true);
-        GlStateManager.enableDepth();
-        GlStateManager.enableTexture2D();
-        GlStateManager.disableBlend();
-        GlStateManager.popMatrix();
+        try {
+            GlStateManager.enableBlend();
+            GlStateManager.tryBlendFuncSeparate(770, 771, 1, 0);
+            GlStateManager.disableTexture2D();
+            GlStateManager.disableDepth();
+            GlStateManager.depthMask(true);
+            GL11.glLineWidth(1.0f);
+            GlStateManager.color((float) color.getRed() / 255.0f, (float) color.getGreen() / 255.0f, (float) color.getBlue() / 255.0f, 1.0f);
+            Tessellator tessellator = Tessellator.getInstance();
+            WorldRenderer wr = tessellator.getWorldRenderer();
+            wr.begin(3, DefaultVertexFormats.POSITION);
+            wr.pos(bb.minX, bb.minY, bb.minZ).endVertex();
+            wr.pos(bb.maxX, bb.minY, bb.minZ).endVertex();
+            wr.pos(bb.maxX, bb.minY, bb.maxZ).endVertex();
+            wr.pos(bb.minX, bb.minY, bb.maxZ).endVertex();
+            wr.pos(bb.minX, bb.minY, bb.minZ).endVertex();
+            tessellator.draw();
+            wr.begin(3, DefaultVertexFormats.POSITION);
+            wr.pos(bb.minX, bb.maxY, bb.minZ).endVertex();
+            wr.pos(bb.maxX, bb.maxY, bb.minZ).endVertex();
+            wr.pos(bb.maxX, bb.maxY, bb.maxZ).endVertex();
+            wr.pos(bb.minX, bb.maxY, bb.maxZ).endVertex();
+            wr.pos(bb.minX, bb.maxY, bb.minZ).endVertex();
+            tessellator.draw();
+            wr.begin(1, DefaultVertexFormats.POSITION);
+            wr.pos(bb.minX, bb.minY, bb.minZ).endVertex();
+            wr.pos(bb.minX, bb.maxY, bb.minZ).endVertex();
+            wr.pos(bb.maxX, bb.minY, bb.minZ).endVertex();
+            wr.pos(bb.maxX, bb.maxY, bb.minZ).endVertex();
+            wr.pos(bb.maxX, bb.minY, bb.maxZ).endVertex();
+            wr.pos(bb.maxX, bb.maxY, bb.maxZ).endVertex();
+            wr.pos(bb.minX, bb.minY, bb.maxZ).endVertex();
+            wr.pos(bb.minX, bb.maxY, bb.maxZ).endVertex();
+            tessellator.draw();
+        } finally {
+            GlStateManager.depthMask(true);
+            GlStateManager.enableDepth();
+            GlStateManager.enableTexture2D();
+            GlStateManager.disableBlend();
+            GlStateManager.popMatrix();
+        }
     }
 
-    // ---- Billboard transform shared by Corner/Other, straight from
-    // Ob0183's pushMatrix/translate/rotate(-fy.Vo)/scale(-0.1,-0.1,0.1)
-    // sequence — yaw-only billboard (no pitch rotate in the source),
-    // mirrored scale on X/Y exactly as written. Depth test is disabled here
-    // too, unconditionally, matching the source. ----
+    // ---- Billboard transform shared by Corner/Other, straight from Ob0183's
+    // pushMatrix/translate/rotate(-fy.Vo)/scale(-0.1,-0.1,0.1) sequence —
+    // yaw-only billboard (no pitch rotate in the source), mirrored scale on
+    // X/Y exactly as written, depth test off unconditionally. ----
     private void beginBadge(double worldX, double worldY, double worldZ) {
         GlStateManager.pushMatrix();
         GlStateManager.translate(worldX, worldY, worldZ);
@@ -369,60 +384,64 @@ public class PlayerESP extends Module {
     }
 
     // ---- Corner badge : Ob0183.ModSpeed(double posX, posY, posZ, int color) ----
-    // The 32-rect outlined double-bracket icon — two vertical corner
-    // brackets (left [-7,-4] and right [4,7]) with a 1px black outline drawn
-    // as thin rects on top, giving the classic "corner ESP" look. Every
-    // coordinate below is copied verbatim from the decompile.
+    // The 32-rect double-bracket icon — two vertical corner brackets (left
+    // [-7,-4], right [4,7]) plus a 1px black outline drawn as thin rects on
+    // top. Every coordinate below is copied verbatim from the decompile.
     private void drawCornerBadge(double x, double y, double z, int color) {
         this.beginBadge(x, y, z);
-        this.border(4.0f, -21.0f, 7.0f, -20.5f, color);
-        this.border(-7.0f, -21.0f, -4.0f, -20.5f, color);
-        this.border(6.5f, -21.0f, 7.0f, -18.5f, color);
-        this.border(-7.0f, -21.0f, -6.5f, -18.5f, color);
-        this.border(-7.0f, 2.0f, -4.0f, 2.5f, color);
-        this.border(4.0f, 2.0f, 7.0f, 2.5f, color);
-        this.border(-7.0f, -0.5f, -6.5f, 2.5f, color);
-        this.border(6.5f, -0.5f, 7.0f, 2.5f, color);
-        int black = 0xFF000000;
-        Gui.drawRect((int) 7.0f, (int) -21.0f, (int) 7.3f, (int) -18.5f, black);
-        Gui.drawRect((int) 6.2f, (int) -20.5f, (int) 6.5f, (int) -18.5f, black);
-        Gui.drawRect((int) 6.5f, (int) -18.8f, (int) 7.0f, (int) -18.5f, black);
-        Gui.drawRect((int) -7.3f, (int) -21.0f, (int) -7.0f, (int) -18.5f, black);
-        Gui.drawRect((int) -6.5f, (int) -20.5f, (int) -6.2f, (int) -18.5f, black);
-        Gui.drawRect((int) -7.0f, (int) -18.8f, (int) -6.5f, (int) -18.5f, black);
-        Gui.drawRect((int) 4.0f, (int) -21.3f, (int) 7.3f, (int) -21.0f, black);
-        Gui.drawRect((int) 4.0f, (int) -20.5f, (int) 6.3f, (int) -20.2f, black);
-        Gui.drawRect((int) 4.0f, (int) -21.3f, (int) 3.8f, (int) -20.2f, black);
-        Gui.drawRect((int) -7.3f, (int) -21.3f, (int) -4.0f, (int) -21.0f, black);
-        Gui.drawRect((int) -6.5f, (int) -20.5f, (int) -4.0f, (int) -20.2f, black);
-        Gui.drawRect((int) -4.0f, (int) -21.3f, (int) -3.8f, (int) -20.2f, black);
-        Gui.drawRect((int) -7.0f, (int) 2.5f, (int) -4.0f, (int) 2.8f, black);
-        Gui.drawRect((int) -6.5f, (int) 1.8f, (int) -4.0f, (int) 2.1f, black);
-        Gui.drawRect((int) -7.0f, (int) -0.5f, (int) -6.5f, (int) -0.2f, black);
-        Gui.drawRect((int) 4.0f, (int) 2.5f, (int) 7.0f, (int) 2.8f, black);
-        Gui.drawRect((int) 4.0f, (int) 1.8f, (int) 6.5f, (int) 2.1f, black);
-        Gui.drawRect((int) 4.0f, (int) 1.8f, (int) 3.8f, (int) 2.8f, black);
-        Gui.drawRect((int) -7.3f, (int) -0.5f, (int) -7.0f, (int) 2.8f, black);
-        Gui.drawRect((int) -6.5f, (int) -0.5f, (int) -6.2f, (int) 2.1f, black);
-        Gui.drawRect((int) -3.8f, (int) 1.8f, (int) -4.0f, (int) 2.8f, black);
-        Gui.drawRect((int) 7.0f, (int) -0.5f, (int) 7.3f, (int) 2.8f, black);
-        Gui.drawRect((int) 6.5f, (int) -0.5f, (int) 6.2f, (int) 2.1f, black);
-        Gui.drawRect((int) 6.5f, (int) -0.5f, (int) 7.0f, (int) -0.2f, black);
-        this.endBadge();
+        try {
+            this.border(4.0f, -21.0f, 7.0f, -20.5f, color);
+            this.border(-7.0f, -21.0f, -4.0f, -20.5f, color);
+            this.border(6.5f, -21.0f, 7.0f, -18.5f, color);
+            this.border(-7.0f, -21.0f, -6.5f, -18.5f, color);
+            this.border(-7.0f, 2.0f, -4.0f, 2.5f, color);
+            this.border(4.0f, 2.0f, 7.0f, 2.5f, color);
+            this.border(-7.0f, -0.5f, -6.5f, 2.5f, color);
+            this.border(6.5f, -0.5f, 7.0f, 2.5f, color);
+            int black = 0xFF000000;
+            Gui.drawRect((int) 7.0f, (int) -21.0f, (int) 7.3f, (int) -18.5f, black);
+            Gui.drawRect((int) 6.2f, (int) -20.5f, (int) 6.5f, (int) -18.5f, black);
+            Gui.drawRect((int) 6.5f, (int) -18.8f, (int) 7.0f, (int) -18.5f, black);
+            Gui.drawRect((int) -7.3f, (int) -21.0f, (int) -7.0f, (int) -18.5f, black);
+            Gui.drawRect((int) -6.5f, (int) -20.5f, (int) -6.2f, (int) -18.5f, black);
+            Gui.drawRect((int) -7.0f, (int) -18.8f, (int) -6.5f, (int) -18.5f, black);
+            Gui.drawRect((int) 4.0f, (int) -21.3f, (int) 7.3f, (int) -21.0f, black);
+            Gui.drawRect((int) 4.0f, (int) -20.5f, (int) 6.3f, (int) -20.2f, black);
+            Gui.drawRect((int) 4.0f, (int) -21.3f, (int) 3.8f, (int) -20.2f, black);
+            Gui.drawRect((int) -7.3f, (int) -21.3f, (int) -4.0f, (int) -21.0f, black);
+            Gui.drawRect((int) -6.5f, (int) -20.5f, (int) -4.0f, (int) -20.2f, black);
+            Gui.drawRect((int) -4.0f, (int) -21.3f, (int) -3.8f, (int) -20.2f, black);
+            Gui.drawRect((int) -7.0f, (int) 2.5f, (int) -4.0f, (int) 2.8f, black);
+            Gui.drawRect((int) -6.5f, (int) 1.8f, (int) -4.0f, (int) 2.1f, black);
+            Gui.drawRect((int) -7.0f, (int) -0.5f, (int) -6.5f, (int) -0.2f, black);
+            Gui.drawRect((int) 4.0f, (int) 2.5f, (int) 7.0f, (int) 2.8f, black);
+            Gui.drawRect((int) 4.0f, (int) 1.8f, (int) 6.5f, (int) 2.1f, black);
+            Gui.drawRect((int) 4.0f, (int) 1.8f, (int) 3.8f, (int) 2.8f, black);
+            Gui.drawRect((int) -7.3f, (int) -0.5f, (int) -7.0f, (int) 2.8f, black);
+            Gui.drawRect((int) -6.5f, (int) -0.5f, (int) -6.2f, (int) 2.1f, black);
+            Gui.drawRect((int) -3.8f, (int) 1.8f, (int) -4.0f, (int) 2.8f, black);
+            Gui.drawRect((int) 7.0f, (int) -0.5f, (int) 7.3f, (int) 2.8f, black);
+            Gui.drawRect((int) 6.5f, (int) -0.5f, (int) 6.2f, (int) 2.1f, black);
+            Gui.drawRect((int) 6.5f, (int) -0.5f, (int) 7.0f, (int) -0.2f, black);
+        } finally {
+            this.endBadge();
+        }
     }
 
     // ---- Other badge : Ob0183.ModSpeed(posX, posY, posZ, color, color2) ----
-    // Simple 4-edge frame in `color` (white, -1) plus one filled accent rect
-    // in `color2` (the per-player hurt/base color) — a plain framed marker,
-    // simpler than Corner's double-bracket icon.
+    // 4-edge frame in `color` (white, -1) plus one filled accent rect in
+    // `color2` (the per-player hurt/accent color).
     private void drawOtherBadge(double x, double y, double z, int color, int color2) {
         this.beginBadge(x, y, z);
-        this.border(-7.0f, -21.0f, 7.0f, -20.5f, color);
-        this.border(-7.0f, 2.0f, 7.0f, 2.5f, color);
-        this.border(6.5f, -0.5f, 7.0f, 2.5f, color);
-        this.border(6.5f, -21.0f, 7.0f, -18.5f, color);
-        Gui.drawRect((int) -8.5f, (int) -17.0f, (int) -8.0f, (int) -2.0f, color2);
-        this.endBadge();
+        try {
+            this.border(-7.0f, -21.0f, 7.0f, -20.5f, color);
+            this.border(-7.0f, 2.0f, 7.0f, 2.5f, color);
+            this.border(6.5f, -0.5f, 7.0f, 2.5f, color);
+            this.border(6.5f, -21.0f, 7.0f, -18.5f, color);
+            Gui.drawRect((int) -8.5f, (int) -17.0f, (int) -8.0f, (int) -2.0f, color2);
+        } finally {
+            this.endBadge();
+        }
     }
 
     public static enum Mode {
