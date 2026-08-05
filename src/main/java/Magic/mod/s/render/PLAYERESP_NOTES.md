@@ -12,6 +12,49 @@
 
 ---
 
+## FIX: Minecraft-режим красил мир в чёрный (шейдеры, не код)
+
+Симптом: мир полностью чёрный, игрок — белое пятно. Все предусловия при
+этом зелёные (`fboEnabled=true fboSetting=true shadersSupported=true
+fastRender=false ofShaders=false aa=false outlineShader=true
+outlineFbo=true`), то есть проход отрабатывал — ломался **композитинг**.
+
+Причина не в байткоде, а в ассетах. Magic'овские копии post-шейдеров
+**переписаны** относительно стоковых ванильных (у Peter — ровно стоковые):
+
+| файл | Peter / ваниль | Magic |
+|---|---|---|
+| `program/blur.fsh` | `vec4(blurred.rgb / (Radius*2+1), totalAlpha)` | `vec4(..., 1.0)` |
+| `program/blit.fsh` | `texture2D(...) * ColorModulate` | `vec4(outColor.rgb, 1.0)` |
+| `program/entity_sobel.fsh` | `vec4(outColor * 0.2, total)` | `vec4(outColor, total)` |
+| `post/entity_outline.json` | `Radius 1.2` | `Radius 2.0` |
+
+Первые два — фатальные: они принудительно ставят **альфу в 1.0**. Цепочка
+`entity_outline → blur → blur → blit` кладёт результат в FBO, который
+`renderEntityOutlineFramebuffer()` блитит поверх экрана с
+`SRC_ALPHA / ONE_MINUS_SRC_ALPHA`. При альфе 1 везде блит не смешивается,
+а **закрашивает весь кадр** — отсюда чёрный мир и белый силуэт вместо
+контура. Третий и четвёртый — косметика: контур в 5 раз ярче и толще.
+
+Чинить глобальной заменой `blur`/`blit` нельзя — их используют ещё ~20
+чейнов (`fxaa`, `antialias`, `outline`, `spider`, super-secret-настройки
+и т.д.), и Magic, судя по всему, правил их намеренно под свои эффекты.
+Поэтому сделаны **изолированные копии только для outline-чейна**:
+
+- `shaders/program/entity_blur.fsh` + `entity_blur.json` (стоковый blur)
+- `shaders/program/entity_blit.fsh` + `entity_blit.json` (стоковый blit)
+- `shaders/program/entity_sobel.fsh` — заменён на стоковый (используется
+  только этим чейном, так что менять безопасно)
+- `shaders/post/entity_outline.json` — Peter'овский (`Radius 1.2`), но
+  ссылается на `entity_blur` / `entity_blit`
+
+Общие `blur.fsh` / `blit.fsh` остались нетронутыми — прочие эффекты
+клиента ведут себя как раньше.
+
+Файлы лежат в `src/main/resources/assets/minecraft/shaders/`.
+
+---
+
 ## FIX: кривые Corner и Other (чёрные пиксели / пропавшие куски рамки)
 
 Мой баг. Peter рисует прямоугольники своим **double**-примитивом
