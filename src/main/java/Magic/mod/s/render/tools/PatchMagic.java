@@ -125,6 +125,9 @@ public class PatchMagic {
     private static void patchRendererLivingEntity(ClassPool pool, String outDir) throws Exception {
         CtClass renderer = pool.get("net.minecraft.client.renderer.entity.RendererLivingEntity");
         CtMethod doRender = renderer.getDeclaredMethod("doRender");
+        // renderLayers() takes partialTicks, which is a doRender parameter and
+        // so is out of scope at the renderModel call site rewritten below.
+        doRender.insertBefore(ESP + ".setPartialTicks($6);");
         final int[] patched = {0};
         doRender.instrument(new ExprEditor() {
             @Override
@@ -133,20 +136,35 @@ public class PatchMagic {
                     return;
                 }
                 patched[0]++;
+                String layers = "$0.renderLayers($1, $2, $3, " + ESP + ".partialTicks(), $4, $5, $6, $7);";
                 call.replace(
-                        "{ if (!$0.renderOutlines && " + ESP + ".wantsStencilOutline($1)) {"
+                        "{ if ($0.renderOutlines) {"
+                                // Minecraft mode fills the outline framebuffer
+                                // here. Adding the layers puts armor into the
+                                // silhouette, so the outline wraps it instead of
+                                // running through it (ThroughArmor off).
                                 + "   $proceed($$);"
-                                + "   " + ESP + ".stencilSetup();"
+                                + "   if (" + ESP + ".layersInVanillaOutline($1)) { " + layers + " }"
+                                + " } else {"
+                                + "   if (" + ESP + ".wantsStencilOutline($1)) {"
+                                // Outline mode: armor is a layer drawn after
+                                // this with depth testing on, so it covers the
+                                // outline. Drawing the layers up front puts the
+                                // outline on top of them (ThroughArmor on).
+                                + "     if (" + ESP + ".layersBeforeStencilOutline($1)) { " + layers + " }"
+                                + "     $proceed($$);"
+                                + "     " + ESP + ".stencilSetup();"
+                                + "     $proceed($$);"
+                                + "     " + ESP + ".stencilFillPass();"
+                                + "     $proceed($$);"
+                                + "     " + ESP + ".stencilOutlinePass();"
+                                + "     " + ESP + ".applyOutlineColor($1);"
+                                + "     " + ESP + ".outlineDrawState();"
+                                + "     $proceed($$);"
+                                + "     " + ESP + ".stencilTeardown();"
+                                + "   }"
                                 + "   $proceed($$);"
-                                + "   " + ESP + ".stencilFillPass();"
-                                + "   $proceed($$);"
-                                + "   " + ESP + ".stencilOutlinePass();"
-                                + "   " + ESP + ".applyOutlineColor($1);"
-                                + "   " + ESP + ".outlineDrawState();"
-                                + "   $proceed($$);"
-                                + "   " + ESP + ".stencilTeardown();"
-                                + " }"
-                                + " $proceed($$); }");
+                                + " } }");
             }
         });
         if (patched[0] == 0) {

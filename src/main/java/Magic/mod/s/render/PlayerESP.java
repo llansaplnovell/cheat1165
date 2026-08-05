@@ -65,6 +65,7 @@ import Magic.Magic;
 import Magic.ink.event.s.EventRender3D;
 import Magic.mod.Category;
 import Magic.mod.Module;
+import Magic.mod.value.values.BoolValue;
 import Magic.mod.value.values.EnumValue;
 import Magic.utils.Friend.FriendManager;
 import Magic.utils.player.ClientUtils;
@@ -86,6 +87,20 @@ public class PlayerESP extends Module {
 
     /** Peter's PlayerESP had exactly one setting: the ESPModes combo. */
     private final EnumValue<Mode> mode = new EnumValue<Mode>("Mode", this, Mode.class, "ESP render style.");
+
+    /**
+     * Only applies to the two modes that outline the real model, so it is
+     * conditioned on them and stays hidden in the GUI for Corner/Box/Other.
+     *
+     * off (default) — armor blocks/shapes the outline
+     * on            — the outline goes through armor
+     *
+     * The mechanism differs per mode because they build their silhouette at
+     * different points; see layersBeforeStencilOutline/layersInVanillaOutline.
+     */
+    private final BoolValue throughArmor = new BoolValue("ThroughArmor", this, false,
+            "Let the outline show through armor instead of armor blocking it.",
+            () -> this.mode.getValue() == Mode.Outline || this.mode.getValue() == Mode.Minecraft);
 
     private static final Color HURT_COLOR = new Color(255, 50, 10, 255);
     private static final Color FRIEND_COLOR = new Color(255, 255, 255, 255);
@@ -368,6 +383,54 @@ public class PlayerESP extends Module {
             return false;
         }
         return entity != Minecraft.getMinecraft().thePlayer;
+    }
+
+    /** partialTicks of the doRender() currently in flight, stashed by the patch. */
+    private static volatile float renderPartialTicks;
+
+    public static void setPartialTicks(float partialTicks) {
+        renderPartialTicks = partialTicks;
+    }
+
+    public static float partialTicks() {
+        return renderPartialTicks;
+    }
+
+    private static boolean layersVisible(EntityLivingBase entity) {
+        return !(entity instanceof EntityPlayer) || !((EntityPlayer) entity).isSpectator();
+    }
+
+    /**
+     * ThroughArmor for Outline mode.
+     *
+     * The stencil silhouette comes from renderModel(), which is the bare body.
+     * Armor is a layer drawn after it with depth testing on, so it paints over
+     * the outline — that is why the outline does not show through armor by
+     * default. Drawing the layers first instead puts the outline on top of
+     * them. (This is also the renderLayers() call Peter has at the head of his
+     * stencil block, which this port had skipped.)
+     */
+    public static boolean layersBeforeStencilOutline(EntityLivingBase entity) {
+        PlayerESP module = active(Mode.Outline);
+        return module != null && module.throughArmor.getValue() && layersVisible(entity);
+    }
+
+    /**
+     * ThroughArmor for Minecraft mode.
+     *
+     * Here the outline buffer is composited over the finished frame, so the
+     * outline is always on top; what decides whether it shows through armor is
+     * whether armor is in the silhouette at all. Vanilla renders only the bare
+     * model into that buffer, so the outline traces the body and runs across
+     * anything the armor adds — i.e. through-armor is what it does by itself,
+     * and this returns true only when we want the opposite. Rendering the
+     * layers into the same buffer makes the outline wrap the armor instead;
+     * setScoreTeamColor() has textures off and a flat colour set, so they land
+     * as silhouette rather than as armor.
+     */
+    public static boolean layersInVanillaOutline(EntityLivingBase entity) {
+        PlayerESP module = active(Mode.Minecraft);
+        return module != null && !module.throughArmor.getValue() && layersVisible(entity);
     }
 
     // ---- Ob0183.ModFullBright() ----
