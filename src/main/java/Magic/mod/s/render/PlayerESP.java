@@ -245,6 +245,36 @@ public class PlayerESP extends Module {
 
     // ================= hooks used by the two renderer patches =================
 
+    /**
+     * Called at the top of the patched RenderGlobal.renderEntityOutlineFramebuffer().
+     *
+     * That method sets up its blend state through GlStateManager, which
+     * caches: enableBlend() does nothing if the cache already believes blend
+     * is on. This client drives a lot of GL through raw GL11 calls that never
+     * update that cache, so by the time the outline is composited the cache
+     * and the real GL state can disagree — and then the blit runs with
+     * blending off and *replaces* the frame instead of compositing onto it.
+     * That is the black-world-with-flat-silhouettes picture: what you see is
+     * the outline buffer's raw rgb, opaque, over everything.
+     *
+     * Setting it with raw GL11 here forces the real state regardless of what
+     * the cache thinks. Only touched while this mode is actually running.
+     */
+    public static void forceOutlineBlend() {
+        // Same decision the gate makes, so the GL state is only forced on
+        // frames that actually composite — otherwise this would leave blend
+        // on and the alpha test off for the rest of the frame.
+        if (!vanillaOutlineHook(sawFramebuffer, sawShader)) {
+            return;
+        }
+        try {
+            GL11.glEnable(GL11.GL_BLEND);
+            GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+            GL11.glDisable(GL11.GL_ALPHA_TEST);
+        } catch (Throwable ignored) {
+        }
+    }
+
     /** Last framebuffer/shader state seen by the hook, for diagnostics. */
     private static volatile boolean sawFramebuffer;
     private static volatile boolean sawShader;

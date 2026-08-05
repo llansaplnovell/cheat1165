@@ -67,8 +67,15 @@ public class PatchMagic {
         method.insertBefore(
                 "if (" + ESP + ".vanillaOutlineHook(this.entityOutlineFramebuffer != null,"
                         + " this.entityOutlineShader != null)) { return true; }");
+        // The composite step sets its blend state through GlStateManager,
+        // whose cache this client desyncs with raw GL11 calls elsewhere; when
+        // it does, enableBlend() no-ops and the outline buffer is blitted
+        // opaque over the whole frame. Force the real state first.
+        CtMethod composite = renderGlobal.getDeclaredMethod("renderEntityOutlineFramebuffer");
+        composite.insertBefore(ESP + ".forceOutlineBlend();");
+
         renderGlobal.writeFile(outDir);
-        System.out.println("Patched RenderGlobal.isRenderEntityOutlines()");
+        System.out.println("Patched RenderGlobal.isRenderEntityOutlines() + renderEntityOutlineFramebuffer()");
     }
 
     /**
