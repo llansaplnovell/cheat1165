@@ -65,14 +65,12 @@ import Magic.Magic;
 import Magic.ink.event.s.EventRender3D;
 import Magic.mod.Category;
 import Magic.mod.Module;
-import Magic.mod.Modules;
 import Magic.mod.value.values.EnumValue;
 import Magic.utils.Friend.FriendManager;
 import Magic.utils.player.ClientUtils;
 import Magic.utils.render.StencilUtil;
 import java.awt.Color;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.gui.Gui;
 import net.minecraft.client.renderer.GlStateManager;
 import net.minecraft.client.renderer.OpenGlHelper;
 import net.minecraft.client.renderer.Tessellator;
@@ -138,23 +136,76 @@ public class PlayerESP extends Module {
 
     public PlayerESP() {
         super("PlayerESP", 0, Category.Render, "Highlights players (Minecraft/Outline/Corner/Box/Other).");
+        instance = this;
+    }
+
+    @Override
+    public void onEnable() {
+        super.onEnable();
+        this.warnIfVanillaOutlineBlocked();
     }
 
     @Override
     public void onSuffixChange() {
         this.setSuffix(this.mode.getValue().enumName());
         super.onSuffixChange();
+        this.warnIfVanillaOutlineBlocked();
     }
 
+    /**
+     * Set from the constructor. Modules.loadModules() creates exactly one
+     * instance, and holding it directly keeps the two renderer patches off
+     * Modules.get() — that lookup is keyed by Class identity and would
+     * silently return null under a launcher with a separate classloader,
+     * leaving the mode dead with no error anywhere.
+     */
+    private static volatile PlayerESP instance;
+
     private static PlayerESP active(Mode wanted) {
+        PlayerESP module = instance;
         try {
-            PlayerESP module = Modules.get(PlayerESP.class);
             if (module != null && module.isEnabled() && module.mode.getValue() == wanted) {
                 return module;
             }
         } catch (Throwable ignored) {
         }
         return null;
+    }
+
+    /**
+     * Which OptiFine feature, if any, makes the vanilla entity-outline pass
+     * unusable right now. Peter's client has no OptiFine so it never had to
+     * care; here it is the difference between the mode working and a black
+     * screen, so it is worth telling the user about instead of failing mute.
+     */
+    private static String vanillaOutlineBlocker() {
+        try {
+            if (optifine.Config.isFastRender()) {
+                return "Fast Render";
+            }
+            if (optifine.Config.isShaders()) {
+                return "shaders";
+            }
+            if (optifine.Config.isAntialiasing()) {
+                return "Antialiasing";
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private void warnIfVanillaOutlineBlocked() {
+        try {
+            if (!this.isEnabled() || this.mode.getValue() != Mode.Minecraft) {
+                return;
+            }
+            String blocker = vanillaOutlineBlocker();
+            if (blocker != null) {
+                ClientUtils.debug("PlayerESP: Minecraft mode is unavailable while OptiFine "
+                        + blocker + " is on — turn it off, or use Outline instead.");
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     // ================= hooks used by the two renderer patches =================
@@ -373,14 +424,59 @@ public class PlayerESP extends Module {
         GlStateManager.popMatrix();
     }
 
+    /**
+     * Ob0183's (double,double,double,double,int) rect primitive: vanilla
+     * Gui.drawRect's exact algorithm — same swap, same colour unpacking,
+     * same POSITION quad — but in double precision.
+     *
+     * This has to be double. These badges are drawn in a 0.1-scaled
+     * billboard space where nearly every coordinate is fractional (7.3,
+     * -20.5, 6.2, -18.8 …). Routing them through the int-typed
+     * Gui.drawRect truncates each one, which is what made Corner's black
+     * outline land on the wrong pixels and collapsed several of Other's
+     * edges to zero width or height so they vanished entirely
+     * (e.g. 6.5→6 and -0.5+0.5=0.0→0 gives a rect of height 0).
+     */
+    private static void drawRect(double left, double top, double right, double bottom, int color) {
+        double swap;
+        if (left < right) {
+            swap = left;
+            left = right;
+            right = swap;
+        }
+        if (top < bottom) {
+            swap = top;
+            top = bottom;
+            bottom = swap;
+        }
+        float a = (float) (color >> 24 & 0xFF) / 255.0f;
+        float r = (float) (color >> 16 & 0xFF) / 255.0f;
+        float g = (float) (color >> 8 & 0xFF) / 255.0f;
+        float b = (float) (color & 0xFF) / 255.0f;
+        Tessellator tessellator = Tessellator.getInstance();
+        WorldRenderer wr = tessellator.getWorldRenderer();
+        GlStateManager.enableBlend();
+        GlStateManager.disableTexture2D();
+        GlStateManager.tryBlendFuncSeparate(770, 771, 1, 0);
+        GlStateManager.color(r, g, b, a);
+        wr.begin(7, DefaultVertexFormats.POSITION);
+        wr.pos(left, bottom, 0.0).endVertex();
+        wr.pos(right, bottom, 0.0).endVertex();
+        wr.pos(right, top, 0.0).endVertex();
+        wr.pos(left, top, 0.0).endVertex();
+        tessellator.draw();
+        GlStateManager.enableTexture2D();
+        GlStateManager.disableBlend();
+    }
+
     // border(): Ob0183.ModSpeed(drawX, drawY, drawWidth, drawHeight, color) —
     // 4 thin edge rects framing a box. drawWidth/drawHeight are the box's
     // right/bottom edge, not a width/height, exactly as named in the source.
-    private void border(float drawX, float drawY, float drawWidth, float drawHeight, int color) {
-        Gui.drawRect((int) drawX, (int) drawY, (int) drawWidth, (int) (drawY + 0.5f), color);
-        Gui.drawRect((int) drawX, (int) (drawY + 0.5f), (int) (drawX + 0.5f), (int) drawHeight, color);
-        Gui.drawRect((int) (drawWidth - 0.5f), (int) (drawY + 0.5f), (int) drawWidth, (int) (drawHeight - 0.5f), color);
-        Gui.drawRect((int) (drawX + 0.5f), (int) (drawHeight - 0.5f), (int) drawWidth, (int) drawHeight, color);
+    private static void border(float drawX, float drawY, float drawWidth, float drawHeight, int color) {
+        drawRect(drawX, drawY, drawWidth, drawY + 0.5f, color);
+        drawRect(drawX, drawY + 0.5f, drawX + 0.5f, drawHeight, color);
+        drawRect(drawWidth - 0.5f, drawY + 0.5f, drawWidth, drawHeight - 0.5f, color);
+        drawRect(drawX + 0.5f, drawHeight - 0.5f, drawWidth, drawHeight, color);
     }
 
     // ---- Corner badge : Ob0183.ModSpeed(double posX, posY, posZ, int color) ----
@@ -390,39 +486,39 @@ public class PlayerESP extends Module {
     private void drawCornerBadge(double x, double y, double z, int color) {
         this.beginBadge(x, y, z);
         try {
-            this.border(4.0f, -21.0f, 7.0f, -20.5f, color);
-            this.border(-7.0f, -21.0f, -4.0f, -20.5f, color);
-            this.border(6.5f, -21.0f, 7.0f, -18.5f, color);
-            this.border(-7.0f, -21.0f, -6.5f, -18.5f, color);
-            this.border(-7.0f, 2.0f, -4.0f, 2.5f, color);
-            this.border(4.0f, 2.0f, 7.0f, 2.5f, color);
-            this.border(-7.0f, -0.5f, -6.5f, 2.5f, color);
-            this.border(6.5f, -0.5f, 7.0f, 2.5f, color);
+            border(4.0f, -21.0f, 7.0f, -20.5f, color);
+            border(-7.0f, -21.0f, -4.0f, -20.5f, color);
+            border(6.5f, -21.0f, 7.0f, -18.5f, color);
+            border(-7.0f, -21.0f, -6.5f, -18.5f, color);
+            border(-7.0f, 2.0f, -4.0f, 2.5f, color);
+            border(4.0f, 2.0f, 7.0f, 2.5f, color);
+            border(-7.0f, -0.5f, -6.5f, 2.5f, color);
+            border(6.5f, -0.5f, 7.0f, 2.5f, color);
             int black = 0xFF000000;
-            Gui.drawRect((int) 7.0f, (int) -21.0f, (int) 7.3f, (int) -18.5f, black);
-            Gui.drawRect((int) 6.2f, (int) -20.5f, (int) 6.5f, (int) -18.5f, black);
-            Gui.drawRect((int) 6.5f, (int) -18.8f, (int) 7.0f, (int) -18.5f, black);
-            Gui.drawRect((int) -7.3f, (int) -21.0f, (int) -7.0f, (int) -18.5f, black);
-            Gui.drawRect((int) -6.5f, (int) -20.5f, (int) -6.2f, (int) -18.5f, black);
-            Gui.drawRect((int) -7.0f, (int) -18.8f, (int) -6.5f, (int) -18.5f, black);
-            Gui.drawRect((int) 4.0f, (int) -21.3f, (int) 7.3f, (int) -21.0f, black);
-            Gui.drawRect((int) 4.0f, (int) -20.5f, (int) 6.3f, (int) -20.2f, black);
-            Gui.drawRect((int) 4.0f, (int) -21.3f, (int) 3.8f, (int) -20.2f, black);
-            Gui.drawRect((int) -7.3f, (int) -21.3f, (int) -4.0f, (int) -21.0f, black);
-            Gui.drawRect((int) -6.5f, (int) -20.5f, (int) -4.0f, (int) -20.2f, black);
-            Gui.drawRect((int) -4.0f, (int) -21.3f, (int) -3.8f, (int) -20.2f, black);
-            Gui.drawRect((int) -7.0f, (int) 2.5f, (int) -4.0f, (int) 2.8f, black);
-            Gui.drawRect((int) -6.5f, (int) 1.8f, (int) -4.0f, (int) 2.1f, black);
-            Gui.drawRect((int) -7.0f, (int) -0.5f, (int) -6.5f, (int) -0.2f, black);
-            Gui.drawRect((int) 4.0f, (int) 2.5f, (int) 7.0f, (int) 2.8f, black);
-            Gui.drawRect((int) 4.0f, (int) 1.8f, (int) 6.5f, (int) 2.1f, black);
-            Gui.drawRect((int) 4.0f, (int) 1.8f, (int) 3.8f, (int) 2.8f, black);
-            Gui.drawRect((int) -7.3f, (int) -0.5f, (int) -7.0f, (int) 2.8f, black);
-            Gui.drawRect((int) -6.5f, (int) -0.5f, (int) -6.2f, (int) 2.1f, black);
-            Gui.drawRect((int) -3.8f, (int) 1.8f, (int) -4.0f, (int) 2.8f, black);
-            Gui.drawRect((int) 7.0f, (int) -0.5f, (int) 7.3f, (int) 2.8f, black);
-            Gui.drawRect((int) 6.5f, (int) -0.5f, (int) 6.2f, (int) 2.1f, black);
-            Gui.drawRect((int) 6.5f, (int) -0.5f, (int) 7.0f, (int) -0.2f, black);
+            drawRect(7.0f, -21.0f, 7.3f, -18.5f, black);
+            drawRect(6.2f, -20.5f, 6.5f, -18.5f, black);
+            drawRect(6.5f, -18.8f, 7.0f, -18.5f, black);
+            drawRect(-7.3f, -21.0f, -7.0f, -18.5f, black);
+            drawRect(-6.5f, -20.5f, -6.2f, -18.5f, black);
+            drawRect(-7.0f, -18.8f, -6.5f, -18.5f, black);
+            drawRect(4.0f, -21.3f, 7.3f, -21.0f, black);
+            drawRect(4.0f, -20.5f, 6.3f, -20.2f, black);
+            drawRect(4.0f, -21.3f, 3.8f, -20.2f, black);
+            drawRect(-7.3f, -21.3f, -4.0f, -21.0f, black);
+            drawRect(-6.5f, -20.5f, -4.0f, -20.2f, black);
+            drawRect(-4.0f, -21.3f, -3.8f, -20.2f, black);
+            drawRect(-7.0f, 2.5f, -4.0f, 2.8f, black);
+            drawRect(-6.5f, 1.8f, -4.0f, 2.1f, black);
+            drawRect(-7.0f, -0.5f, -6.5f, -0.2f, black);
+            drawRect(4.0f, 2.5f, 7.0f, 2.8f, black);
+            drawRect(4.0f, 1.8f, 6.5f, 2.1f, black);
+            drawRect(4.0f, 1.8f, 3.8f, 2.8f, black);
+            drawRect(-7.3f, -0.5f, -7.0f, 2.8f, black);
+            drawRect(-6.5f, -0.5f, -6.2f, 2.1f, black);
+            drawRect(-3.8f, 1.8f, -4.0f, 2.8f, black);
+            drawRect(7.0f, -0.5f, 7.3f, 2.8f, black);
+            drawRect(6.5f, -0.5f, 6.2f, 2.1f, black);
+            drawRect(6.5f, -0.5f, 7.0f, -0.2f, black);
         } finally {
             this.endBadge();
         }
@@ -434,11 +530,11 @@ public class PlayerESP extends Module {
     private void drawOtherBadge(double x, double y, double z, int color, int color2) {
         this.beginBadge(x, y, z);
         try {
-            this.border(-7.0f, -21.0f, 7.0f, -20.5f, color);
-            this.border(-7.0f, 2.0f, 7.0f, 2.5f, color);
-            this.border(6.5f, -0.5f, 7.0f, 2.5f, color);
-            this.border(6.5f, -21.0f, 7.0f, -18.5f, color);
-            Gui.drawRect((int) -8.5f, (int) -17.0f, (int) -8.0f, (int) -2.0f, color2);
+            border(-7.0f, -21.0f, 7.0f, -20.5f, color);
+            border(-7.0f, 2.0f, 7.0f, 2.5f, color);
+            border(6.5f, -0.5f, 7.0f, 2.5f, color);
+            border(6.5f, -21.0f, 7.0f, -18.5f, color);
+            drawRect(-8.5f, -17.0f, -8.0f, -2.0f, color2);
         } finally {
             this.endBadge();
         }
