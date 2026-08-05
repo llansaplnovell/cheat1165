@@ -217,20 +217,28 @@ public class PlayerESP extends Module {
             if (!OpenGlHelper.shadersSupported) {
                 ClientUtils.debug("PlayerESP: Minecraft mode needs shader support, which this "
                         + "driver reports as unavailable. Use Outline instead.");
-            } else if (!mc.gameSettings.fboEnable) {
-                ClientUtils.debug("PlayerESP: Minecraft mode needs FBOs — enable them in "
-                        + "Video Settings, or use Outline instead.");
             } else if (blocker != null) {
                 ClientUtils.debug("PlayerESP: Minecraft mode is unavailable while OptiFine "
                         + blocker + " is on — turn it off, or use Outline instead.");
+            } else if (!OpenGlHelper.isFramebufferEnabled()) {
+                ClientUtils.debug("PlayerESP: Minecraft mode needs framebuffers, which are off "
+                        + "right now (Video Settings -> FBO). Use Outline instead.");
             } else if (hookRan && (!sawFramebuffer || !sawShader)) {
                 ClientUtils.debug("PlayerESP: Minecraft mode could not build the entity outline "
                         + "shader (check the log for \"Failed to load shader\"). Use Outline instead.");
             } else {
-                ClientUtils.debug("PlayerESP: Minecraft mode active (state: shaders=" + OpenGlHelper.shadersSupported
-                        + " fbo=" + mc.gameSettings.fboEnable + " outlineShader=" + sawShader
-                        + " outlineFbo=" + sawFramebuffer + " hookRan=" + hookRan + ").");
+                ClientUtils.debug("PlayerESP: Minecraft mode active.");
             }
+            // Full state dump — one line, so a screenshot of it is enough to
+            // tell exactly which precondition is the one saying no.
+            ClientUtils.debug("PlayerESP state: fboEnabled=" + OpenGlHelper.isFramebufferEnabled()
+                    + " fboSetting=" + mc.gameSettings.fboEnable
+                    + " shadersSupported=" + OpenGlHelper.shadersSupported
+                    + " fastRender=" + optifine.Config.isFastRender()
+                    + " ofShaders=" + optifine.Config.isShaders()
+                    + " aa=" + optifine.Config.isAntialiasing()
+                    + " outlineShader=" + sawShader + " outlineFbo=" + sawFramebuffer
+                    + " hookRan=" + hookRan);
         } catch (Throwable ignored) {
         }
     }
@@ -261,7 +269,21 @@ public class PlayerESP extends Module {
         if (!hasFramebuffer || !hasShader) {
             return false;
         }
-        // OptiFine's own guard — bypassing it is what blacked out the screen.
+        // The authoritative precondition, and the one whose absence produced
+        // the black-world/white-player artifact. Framebuffer.bindFramebuffer()
+        // is a no-op when this is false — but framebufferClear() calls it and
+        // then runs GlStateManager.clear() unconditionally, so the outline
+        // pass ends up clearing the real screen and drawing the players
+        // straight onto it with depthFunc(GL_ALWAYS). Checking OptiFine's
+        // three Config flags separately was not enough: this also covers
+        // framebufferSupported and the fboEnable video setting.
+        try {
+            if (!OpenGlHelper.isFramebufferEnabled()) {
+                return false;
+            }
+        } catch (Throwable ignored) {
+            return false;
+        }
         return vanillaOutlineBlocker() == null;
     }
 
