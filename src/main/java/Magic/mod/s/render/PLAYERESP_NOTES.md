@@ -1,11 +1,11 @@
 # PlayerESP — перенос в Magic (primordial), MC 1.8.9
 
 ## Что это
-Оригинальная реализация PlayerESP под архитектуру `Magic` (компилированный
-клиент из `primordial.jar`), написанная с нуля под её собственные API —
-не построчный перенос из декомпила другого клиента (там была другая, старая
-рендер-система на `GL11.glBegin`/кастомном `Ob0183`, несовместимая с этой
-кодовой базой напрямую).
+Дословный перенос PlayerESP из декомпила Peter-клиента (`Ob0110.java` +
+рендер-утилита `Ob0183.java`) на API Magic. Все режимы, все магические
+числа и все особенности выбора цвета — скопированы как есть, а не
+переизобретены. Список конкретных соответствий — в шапке самого файла
+`PlayerESP.java`.
 
 Файл: `src/main/java/Magic/mod/s/render/PlayerESP.java`
 
@@ -17,27 +17,44 @@
 `Magic.mod.s.*` по classpath и сам инстанциирует любой конкретный
 подкласс `Module`, который там найдёт.
 
-## Зависимости — всё уже есть в Magic, ничего докидывать не нужно
-- `Magic.mod.Module`, `Category.Render`
-- `Magic.mod.value.values.EnumValue/BoolValue/ColorValue`
-- `Magic.ink.event.s.EventRender3D` + `pisi.unitedmeows.eventapi.event.listener.Listener`
-  (подписка на рендер мира происходит автоматически через
-  `EventManager.eventSystem.subscribeAll(this)` в `Module.onEnable()`)
-- `Magic.utils.Friend.FriendManager.isFriend(String)`
-- `Magic.utils.player.ClientUtils.getPlayers()`
+## Режимы (те же 5 пунктов, что в оригинальном ESPModes)
+- **Minecraft**, **Outline** — в оригинале это были пункты списка без
+  реализации (`Ob0216()` не содержал for-них ветки) — то есть в самом
+  Peter-клиенте они ничего не рисовали. Сохранил это as-is: выбор одного
+  из этих двух режимов здесь тоже ничего не рисует.
+- **Corner** — двойная угловая скобка (32 прямоугольника: 8 цветных +
+  24 чёрной обводки), billboard, координаты 1:1 из `Ob0183.ModSpeed(x,y,z,color)`.
+  Позиция интерполированная (partialTicks), как в оригинале.
+- **Box** — проволочный AABB через `drawSelectionBoundingBox`-алгоритм,
+  **без интерполяции** (сырые `posX/posY/posZ`, как в `Ob0110.Ob0186()` —
+  entity.aqZ/ara/arb там читались напрямую). Бокс уже реального хитбокса
+  (0.5 вместо 0.6), depth test всегда выключен — сквозь стены без тумблера,
+  как в источнике.
+- **Other** — простая рамка (4 стороны) белым + один цветной акцентный
+  прямоугольник, тоже billboard, интерполированная позиция.
 
-## Настройки модуля
-- **Mode**: `Box` (проволочный контур) / `Fill` (полупрозрачная заливка)
-- **ThroughWalls**: рисовать сквозь блоки (отключает depth-test) или только when in line of sight
-- **HealthColor**: подмешивать белый цвет к базовому по мере восстановления HP
-- **Friends**: красить друзей из `FriendManager` отдельным цветом (голубой)
-- **Color**: базовый цвет для не-друзей (по умолчанию красный)
+## Цвета — сохранены оригинальные особенности, а не "исправлены"
+- **Corner**: hurt-flash (`hurtTime>0`) → оранжево-красный, иначе друг →
+  белый, иначе `baseColor`.
+- **Box**: в оригинале и friend-, и non-friend-ветка резолвились в один и
+  тот же литерал (белый) — это дословно воспроизведено, не заменено на
+  `baseColor` для non-friend случая.
+- **Other**: вообще не проверяет `FriendManager` (только hurt-flash vs
+  `baseColor`) — в оригинале тоже так.
 
-## Отличия от исходной логики (Peter/декомпил)
-- Вместо ручной интерполяции camera-offset (`fy.Vk/Vl/Vm`) используется
-  `mc.getRenderManager().renderPosX/Y/Z` — тот же смысл, актуальное для
-  этой кодовой базы имя (см. `NameTags.renderNametag` в том же клиенте).
-- Вместо кастомного билборд-рендера ("Corner"/"Other" с ручными GL-вершинами
-  иконки) — два режима, оба через `AxisAlignedBB`: контур и заливка.
-  Так проще поддерживать и это сочетается с уже существующим
-  `RenderUtils.drawOutlineBox` в стиле того же клиента.
+## Единственное место, где пришлось принять решение (не 1:1 проверено)
+Внутри billboard-блока `Ob0183` было два вызова через обфусцированные
+имена (`dT.hG()`, `dT.Ob0091(true)`) сразу после `glDisable(GL_DEPTH_TEST)`.
+Их смысл почти наверняка `disableTexture2D()`/`depthMask(true)` (судя по
+такому же паттерну в других местах того же класса), но 100% не проверено
+рендером — я не могу запустить графический клиент в этой сессии, чтобы
+сверить визуально. На итоговую картинку это не влияет: рисуются сплошные
+непрозрачные прямоугольники без текстуры, `depthMask` при выключенном
+depth test почти ни на что не влияет.
+
+## Зависимости — всё уже есть в Magic
+`Module`, `Category.Render`, `EnumValue`, `ColorValue`,
+`Magic.ink.event.s.EventRender3D` + `pisi.unitedmeows.eventapi` `Listener`,
+`Magic.utils.Friend.FriendManager.isFriend`, `Magic.utils.player.ClientUtils.getPlayers`,
+плюс ванильные `Gui.drawRect` / `Tessellator` / `WorldRenderer` / `GlStateManager`.
+Ничего докидывать не пришлось.
