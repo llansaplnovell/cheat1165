@@ -46,9 +46,17 @@
  *     (entityOutlineFramebuffer/entityOutlineShader, driven by
  *     shaders/post/entity_outline.json) instead of drawing anything itself.
  *
- * THE ONE DELIBERATE DIFFERENCE FROM PETER (and why)
- * --------------------------------------------------
- * Peter's isRenderEntityOutlines() equivalent returns true *unconditionally*
+ * THE DELIBERATE DIFFERENCES FROM PETER (and why)
+ * -----------------------------------------------
+ * 1. ThroughArmor. Peter had one setting, the mode combo, and both outline
+ * modes were stuck with whatever their placement in the render happened to
+ * give: Outline's silhouette is drawn before the armor layers and so gets
+ * painted over by them, while Minecraft's is composited over the finished
+ * frame and so is never hidden at all. That is now a setting, on by default
+ * for both, which does change Outline's out-of-the-box look. See
+ * stencilOutlineOverLayers() and outlineLayersInVanillaPass().
+ *
+ * 2. Peter's isRenderEntityOutlines() equivalent returns true *unconditionally*
  * for Minecraft mode. His client has no OptiFine, so that is safe there.
  * Magic ships OptiFine, whose isRenderEntityOutlines() carries an extra
  * guard — !(Config.isFastRender() || isShaders() || isAntialiasing()) —
@@ -65,6 +73,7 @@ import Magic.Magic;
 import Magic.ink.event.s.EventRender3D;
 import Magic.mod.Category;
 import Magic.mod.Module;
+import Magic.mod.value.values.BoolValue;
 import Magic.mod.value.values.EnumValue;
 import Magic.utils.Friend.FriendManager;
 import Magic.utils.player.ClientUtils;
@@ -86,6 +95,27 @@ public class PlayerESP extends Module {
 
     /** Peter's PlayerESP had exactly one setting: the ESPModes combo. */
     private final EnumValue<Mode> mode = new EnumValue<Mode>("Mode", this, Mode.class, "ESP render style.");
+
+    /**
+     * Whether the outline is visible over armor. Only the two modes that
+     * outline the real model can answer that question, so the Condition keeps
+     * it hidden in the ClickGUI for Corner/Box/Other (ModulePanel and
+     * ValuePanel both skip values whose isOpen() is false).
+     *
+     * on (default) — the outline shows through armor, in both modes
+     * off          — armor covers (Outline) / shapes (Minecraft) the outline
+     *
+     * Default on because that is what the mode is for; note this *changes*
+     * Outline's out-of-the-box look, which used to be the "off" behaviour,
+     * and leaves Minecraft's alone, which was already the "on" behaviour.
+     *
+     * The two modes need different mechanisms because they build their
+     * silhouette at different points — see stencilOutlineOverLayers() and
+     * outlineLayersInVanillaPass().
+     */
+    private final BoolValue throughArmor = new BoolValue("ThroughArmor", this, true,
+            "Show the outline through armor.",
+            () -> this.mode.getValue() == Mode.Outline || this.mode.getValue() == Mode.Minecraft);
 
     private static final Color HURT_COLOR = new Color(255, 50, 10, 255);
     private static final Color FRIEND_COLOR = new Color(255, 255, 255, 255);
@@ -139,9 +169,18 @@ public class PlayerESP extends Module {
         instance = this;
     }
 
+    /**
+     * Mode the chat report below was last written for. Every value change
+     * routes through onSuffixChange() — with Mode the only setting that used
+     * to mean "the mode changed", but ThroughArmor goes through it too, and
+     * the report is a three-line dump nobody wants repeated on every click.
+     */
+    private Mode reportedMode;
+
     @Override
     public void onEnable() {
         super.onEnable();
+        this.reportedMode = this.mode.getValue();
         this.warnIfVanillaOutlineBlocked();
     }
 
@@ -149,7 +188,10 @@ public class PlayerESP extends Module {
     public void onSuffixChange() {
         this.setSuffix(this.mode.getValue().enumName());
         super.onSuffixChange();
-        this.warnIfVanillaOutlineBlocked();
+        if (this.mode.getValue() != this.reportedMode) {
+            this.reportedMode = this.mode.getValue();
+            this.warnIfVanillaOutlineBlocked();
+        }
     }
 
     /**
@@ -359,15 +401,99 @@ public class PlayerESP extends Module {
     }
 
     /**
-     * Called from the patched RendererLivingEntity.doRender().
-     * Mirrors Peter's `entity instanceof nH && entity != f.jF` — every living
-     * entity except your own player, not only players.
+     * Whether Outline mode wants a silhouette around this entity at all —
+     * the shared half of the two hooks below, which only differ in where
+     * doRender() draws it. Mirrors Peter's `entity instanceof nH &&
+     * entity != f.jF`: every living entity except your own player, not only
+     * players.
      */
     public static boolean wantsStencilOutline(EntityLivingBase entity) {
         if (entity == null || active(Mode.Outline) == null) {
             return false;
         }
         return entity != Minecraft.getMinecraft().thePlayer;
+    }
+
+    // ------------------------- ThroughArmor plumbing -------------------------
+    //
+    // Where the stencil block is placed inside doRender() is the whole trick
+    // for Outline mode, so wantsStencilOutline() is split into the two call
+    // sites the patch can put it at. Exactly one of them is ever true.
+
+    /**
+     * Outline mode, ThroughArmor OFF — draw the silhouette at the original
+     * spot, i.e. at the renderModel() call, before the layers.
+     *
+     * outlineDrawState() draws with GL_DEPTH_TEST off and glDepthMask(false),
+     * so the outline writes no depth of its own; armor is a layer drawn
+     * afterwards with depth testing on and simply paints over it. That is why
+     * this placement means "armor covers the outline" — reproduced unchanged,
+     * so switching the setting off is byte-for-byte the old behaviour.
+     */
+    public static boolean stencilOutlineBeforeLayers(EntityLivingBase entity) {
+        PlayerESP module = active(Mode.Outline);
+        return module != null && !module.throughArmor.getValue() && wantsStencilOutline(entity);
+    }
+
+    /**
+     * Outline mode, ThroughArmor ON (default) — draw the very same silhouette,
+     * unchanged, but after renderLayers() instead of before it.
+     *
+     * Nothing about the outline itself changes: the same four renderModel()
+     * passes over the bare body, the same stencil ops, the same colour. Only
+     * the armor is no longer painted on top of it afterwards, so the line
+     * stays visible across the armor. Drawing the layers a second time up
+     * front would achieve the same picture, but it renders every layer twice
+     * per entity (and blends the enchantment glint twice); moving the block
+     * costs nothing.
+     */
+    public static boolean stencilOutlineOverLayers(EntityLivingBase entity) {
+        PlayerESP module = active(Mode.Outline);
+        return module != null && module.throughArmor.getValue() && wantsStencilOutline(entity);
+    }
+
+    /**
+     * Minecraft mode, ThroughArmor OFF — render the layers into the entity
+     * outline framebuffer as well.
+     *
+     * This mode does not draw anything itself: it rides vanilla's spectator
+     * glow pass, which composites its buffer over the finished frame, so its
+     * outline is always on top and the only question is what is in the
+     * silhouette. Vanilla puts the bare model there and nothing else, which is
+     * precisely why the glow runs across armor by default — so ThroughArmor ON
+     * is the untouched vanilla path, and only OFF has to do anything. Adding
+     * the layers to that buffer makes the outline wrap the armor instead.
+     *
+     * setScoreTeamColor() has already disabled both texture units and set a
+     * flat colour for this pass, so the layers land as silhouette rather than
+     * as textured armor.
+     */
+    public static boolean outlineLayersInVanillaPass(EntityLivingBase entity) {
+        PlayerESP module = active(Mode.Minecraft);
+        if (module == null || module.throughArmor.getValue()) {
+            return false;
+        }
+        // Vanilla's own renderLayers() call carries this guard; keep it, so a
+        // spectator does not get armor drawn for them here and nowhere else.
+        return !(entity instanceof EntityPlayer) || !((EntityPlayer) entity).isSpectator();
+    }
+
+    /**
+     * renderLayers() needs partialTicks, which is a doRender() parameter and
+     * therefore out of scope at the renderModel() call site the patch rewrites
+     * (the class carries no LocalVariableTable, so javassist cannot name it).
+     *
+     * This is the same float and not an approximation of it: runGameLoop()
+     * renders via entityRenderer.func_181560_a(this.timer.renderPartialTicks),
+     * and nothing writes the field again for the duration of that call, so
+     * every partialTicks handed down the render path is this value.
+     */
+    public static float partialTicks() {
+        try {
+            return Minecraft.getMinecraft().timer.renderPartialTicks;
+        } catch (Throwable ignored) {
+            return 1.0f;
+        }
     }
 
     // ---- Ob0183.ModFullBright() ----
