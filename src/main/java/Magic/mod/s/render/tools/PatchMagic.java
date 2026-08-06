@@ -99,6 +99,10 @@ public class PatchMagic {
         // opaque over the whole frame. Force the real state first.
         CtMethod composite = renderGlobal.getDeclaredMethod("renderEntityOutlineFramebuffer");
         composite.insertBefore(ESP + ".forceOutlineBlend();");
+        // ...and drop the armor mask again once the glow has been blitted.
+        // insertAfter with asFinally so it also runs if the blit throws —
+        // leaving GL_STENCIL_TEST on would silently eat the rest of the frame.
+        composite.insertAfter(ESP + ".afterOutlineComposite();", true);
 
         // Load the outline chain from our own resource names.
         //
@@ -155,10 +159,11 @@ public class PatchMagic {
      *    still four passes over the bare model — but armor is no longer drawn
      *    on top of it, so the outline stays visible across the armor. Exactly
      *    one of the two placements runs; the module decides which.
-     *  - Minecraft, ThroughArmor off: the armor is drawn into the
-     *    renderOutlines branch too, so it joins the silhouette written to the
-     *    entity outline framebuffer and the glow wraps it instead of crossing
-     *    it. On (default) leaves that branch exactly as vanilla has it.
+     *  - Minecraft, ThroughArmor off: after the layers are drawn for real, the
+     *    armor is drawn once more with colour writes off, stamping itself into
+     *    the stencil buffer; RenderGlobal's composite then skips those pixels.
+     *    The outline itself is left alone — same silhouette, same place, minus
+     *    the part armor covers. On (default) marks nothing at all.
      */
     private static void patchRendererLivingEntity(ClassPool pool, String outDir) throws Exception {
         CtClass renderer = pool.get("net.minecraft.client.renderer.entity.RendererLivingEntity");
@@ -175,20 +180,7 @@ public class PatchMagic {
                             "{ if (!$0.renderOutlines && " + ESP + ".stencilOutlineBeforeLayers($1)) {"
                                     + stencilBlock("$proceed($$);")
                                     + " }"
-                                    + " $proceed($$);"
-                                    // Minecraft mode, ThroughArmor off: this is
-                                    // the pass that fills the entity outline
-                                    // framebuffer, and vanilla puts only the
-                                    // bare model in it. Adding the armor puts
-                                    // it into the silhouette, so the outline
-                                    // wraps it instead of crossing it. Armor
-                                    // only, and not through renderLayers() —
-                                    // see renderOutlineArmor() for why the
-                                    // other layers wreck this buffer.
-                                    + " if ($0.renderOutlines && " + ESP + ".armorInVanillaOutline($1)) {"
-                                    + "   " + ESP + ".renderOutlineArmor($0.layerRenderers, $1, $2, $3, "
-                                    + ESP + ".partialTicks(), $4, $5, $6, $7);"
-                                    + " } }");
+                                    + " $proceed($$); }");
                     return;
                 }
                 if (!"renderLayers".equals(call.getMethodName())) {
@@ -211,6 +203,15 @@ public class PatchMagic {
                         "{ $proceed($$);"
                                 + " if (!$0.renderOutlines && " + ESP + ".stencilOutlineOverLayers($1)) {"
                                 + stencilBlock("$0.renderModel($1, $2, $3, $5, $6, $7, $8);")
+                                + " }"
+                                // Minecraft mode, ThroughArmor off: the armor is
+                                // on screen now, so draw it once more with colour
+                                // writes off to stamp it into the stencil buffer.
+                                // The composite then skips those pixels, which
+                                // leaves the glow exactly where vanilla put it and
+                                // only takes away the part armor covers.
+                                + " if (!$0.renderOutlines && " + ESP + ".armorMasksVanillaOutline($1)) {"
+                                + "   " + ESP + ".markArmorMask($0.layerRenderers, $1, $2, $3, $4, $5, $6, $7, $8);"
                                 + " } }");
             }
         });

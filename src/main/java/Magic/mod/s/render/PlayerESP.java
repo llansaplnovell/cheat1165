@@ -54,7 +54,7 @@
  * painted over by them, while Minecraft's is composited over the finished
  * frame and so is never hidden at all. That is now a setting, on by default
  * for both, which does change Outline's out-of-the-box look. See
- * stencilOutlineOverLayers() and renderOutlineArmor().
+ * stencilOutlineOverLayers() and armorMasksVanillaOutline().
  *
  * 2. Peter's isRenderEntityOutlines() equivalent returns true *unconditionally*
  * for Minecraft mode. His client has no OptiFine, so that is safe there.
@@ -80,7 +80,6 @@ import Magic.utils.player.ClientUtils;
 import Magic.utils.render.StencilUtil;
 import java.awt.Color;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.renderer.GLAllocation;
 import net.minecraft.client.renderer.GlStateManager;
 import net.minecraft.client.renderer.OpenGlHelper;
 import net.minecraft.client.renderer.Tessellator;
@@ -113,7 +112,7 @@ public class PlayerESP extends Module {
      *
      * The two modes need different mechanisms because they build their
      * silhouette at different points — see stencilOutlineOverLayers() and
-     * renderOutlineArmor().
+     * armorMasksVanillaOutline().
      */
     private final BoolValue throughArmor = new BoolValue("ThroughArmor", this, true,
             "Show the outline through armor.",
@@ -324,6 +323,16 @@ public class PlayerESP extends Module {
             GL11.glEnable(GL11.GL_BLEND);
             GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
             GL11.glDisable(GL11.GL_ALPHA_TEST);
+            // ThroughArmor off: skip the pixels armor marked while the world
+            // was being drawn, so the glow keeps its shape but stops being
+            // visible over armor. Nothing was marked when the setting is on, so
+            // the test is simply not set up and the blit is the vanilla one.
+            if (armorMaskWritten) {
+                GL11.glEnable(2960);                // GL_STENCIL_TEST
+                GL11.glStencilMask(0);              // the blit must not write it
+                GL11.glStencilFunc(517, 1, 255);    // GL_NOTEQUAL, ref 1
+                GL11.glStencilOp(7680, 7680, 7680); // KEEP
+            }
         } catch (Throwable t) {
             compositeGlState = "sample failed: " + t;
         }
@@ -455,53 +464,73 @@ public class PlayerESP extends Module {
     }
 
     /**
-     * Minecraft mode, ThroughArmor OFF — add the armor to the entity outline
-     * silhouette for this entity.
+     * Minecraft mode, ThroughArmor OFF — whether this entity's armor should
+     * mask the glow.
      *
-     * This mode does not draw anything itself: it rides vanilla's spectator
-     * glow pass, which composites its buffer over the finished frame, so its
-     * outline is always on top and the only question is what is in the
-     * silhouette. Vanilla puts the bare model there and nothing else, which is
-     * precisely why the glow runs across armor by default — so ThroughArmor ON
-     * is the untouched vanilla path, and only OFF has to do anything.
+     * The mode draws nothing itself: it rides vanilla's spectator glow pass,
+     * which composites its buffer over the finished frame. That is why the glow
+     * sits on top of armor — the composite has no idea anything is in front of
+     * it. What it must NOT do is change where the outline is: the silhouette
+     * stays the bare model, exactly as vanilla builds it, so the glow keeps the
+     * shape and position it has with the setting on. Only the part of it that
+     * armor covers is cut away, which is what "not through armor" means.
      */
-    public static boolean armorInVanillaOutline(EntityLivingBase entity) {
+    public static boolean armorMasksVanillaOutline(EntityLivingBase entity) {
+        // Nothing to mask when the composite is not running at all (OptiFine
+        // Fast Render / shaders / AA, no framebuffer, ...). Marking anyway
+        // would leave a stencil nobody ever clears, and the frame the pass
+        // came back would start with stale marks on it.
+        return armorMaskWanted(entity) && vanillaOutlineHook(sawFramebuffer, sawShader);
+    }
+
+    /** The mode/setting half of the above, split out so it can be tested. */
+    static boolean armorMaskWanted(EntityLivingBase entity) {
         PlayerESP module = active(Mode.Minecraft);
         if (module == null || module.throughArmor.getValue()) {
             return false;
         }
-        // Vanilla's own renderLayers() call carries this guard; keep it, so a
-        // spectator does not get armor drawn for them here and nowhere else.
+        // Vanilla's own renderLayers() call carries this guard.
         return !(entity instanceof EntityPlayer) || !((EntityPlayer) entity).isSpectator();
     }
 
+    /** Whether a mask was written this frame, i.e. whether the blit must test it. */
+    private static volatile boolean armorMaskWritten;
+
     /**
-     * Puts the armor into the entity outline framebuffer, and nothing else.
+     * Marks the pixels the armor occupies in the main framebuffer's stencil
+     * buffer, so the composite can skip them.
      *
-     * Deliberately not renderLayers(): that draws every layer, and two of them
-     * ruin this buffer. magic_esp_edge.fsh finds edges by comparing the ALPHA
-     * of neighbouring texels, so the silhouette only reads as an outline while
-     * its alpha is uniform — one flat region on a cleared buffer, edges just at
-     * its border. LayerHeldItem and LayerCustomHead both go through
-     * RenderItem, which turns texturing back on (setScoreTeamColor had it off),
-     * and a textured draw writes the texture's alpha: holes and soft edges all
-     * over the inside of the figure, every one of which the shader then draws.
-     * That is the glow painted across the player instead of around them. The
-     * held item would also become part of the silhouette, which is not what
-     * "same outline, just not through armor" means anyway.
+     * Runs in the NORMAL render pass, right after the armor was drawn for real,
+     * and draws the same armor a second time with colour writes off — nothing
+     * reaches the screen, only the stencil. Because the armor's own depth is
+     * already in the buffer, the default GL_LEQUAL test passes on exactly the
+     * armor pixels that ended up visible: armor hidden behind a wall marks
+     * nothing, so the glow still shows through walls, which is the point of the
+     * mode.
      *
-     * So: armor layers only, and every fragment of them forced to one flat
-     * opaque colour — see beginArmorSilhouette(), which does that in a way the
-     * layer cannot override.
+     * Colours, textures and the enchantment glint are all irrelevant here —
+     * glColorMask discards every one of them. That is also why this replaces
+     * the earlier attempt at adding armor to the outline silhouette: that moved
+     * the outline, this does not touch it.
      */
-    public static void renderOutlineArmor(java.util.List<?> layers, EntityLivingBase entity,
-                                          float limbSwing, float limbSwingAmount, float partialTicks,
-                                          float ageInTicks, float netHeadYaw, float headPitch, float scale) {
+    public static void markArmorMask(java.util.List<?> layers, EntityLivingBase entity,
+                                     float limbSwing, float limbSwingAmount, float partialTicks,
+                                     float ageInTicks, float netHeadYaw, float headPitch, float scale) {
         if (layers == null || entity == null) {
             return;
         }
         try {
-            beginArmorSilhouette();
+            // Idempotent: it re-attaches a DEPTH24_STENCIL8 renderbuffer once
+            // and then marks itself done, so this is safe per entity per frame.
+            StencilUtil.checkSetupFBO(Minecraft.getMinecraft().getFramebuffer());
+            GL11.glEnable(2960);                    // GL_STENCIL_TEST
+            GL11.glStencilMask(255);
+            GL11.glStencilFunc(519, 1, 255);        // GL_ALWAYS, ref 1
+            GL11.glStencilOp(7680, 7680, 7681);     // KEEP, KEEP, REPLACE — depth decides
+            GL11.glColorMask(false, false, false, false);
+            // depthMask through GlStateManager: the glint drives it through
+            // GlStateManager too, so going raw here would leave the cache lying.
+            GlStateManager.depthMask(false);
             for (Object layer : layers) {
                 if (!(layer instanceof LayerArmorBase)) {
                     continue;
@@ -510,139 +539,39 @@ public class PlayerESP extends Module {
                     ((LayerArmorBase<?>) layer).doRenderLayer(entity, limbSwing, limbSwingAmount,
                             partialTicks, ageInTicks, netHeadYaw, headPitch, scale);
                 } catch (Throwable ignored) {
-                    // One bad layer must not take down the outline pass: the
-                    // rest of it still has entities to draw.
+                    // One bad layer must not take the rest of the frame with it.
                 }
             }
+            armorMaskWritten = true;
         } catch (Throwable ignored) {
         } finally {
-            endArmorSilhouette();
+            GL11.glColorMask(true, true, true, true);
+            GL11.glStencilMask(255);
+            GL11.glDisable(2960);
+            GlStateManager.depthMask(true);
         }
     }
 
-    /** Scratch for reading GL_CURRENT_COLOR — LWJGL wants 16 floats of room. */
-    private static final java.nio.FloatBuffer COLOR_QUERY = GLAllocation.createDirectFloatBuffer(16);
-    /** The colour every armor fragment is forced to. */
-    private static final java.nio.FloatBuffer SILHOUETTE_COLOR = GLAllocation.createDirectFloatBuffer(4);
-
-    private static boolean savedBlend;
-    private static boolean savedAlphaTest;
-    private static boolean savedTexture2D;
-
     /**
-     * Forces the armor draw to put out one flat opaque colour per fragment,
-     * whatever LayerArmorBase does inside.
+     * Called at the end of the patched renderEntityOutlineFramebuffer(), after
+     * the glow has been blitted: drops the stencil test again and clears the
+     * mask so the next frame starts from nothing.
      *
-     * Merely turning texturing off is not enough, and that is what the first
-     * attempt got wrong. LayerArmorBase sets its own glColor per piece (the dye
-     * colour for leather), and for enchanted armor it then draws the glint over
-     * the same model in purple (0.5, 0.25, 0.8) with additive blending — which
-     * is exactly the purple that showed up in the outline, and why the result
-     * did not read as a silhouette any more.
-     *
-     * So instead of trying to stop the layer from choosing colours, this makes
-     * the choice irrelevant: texturing ON, but with the texture environment set
-     * to REPLACE from GL_CONSTANT for both RGB and alpha. Every fragment then
-     * comes out as the constant, no matter what texture is bound, what glColor
-     * the layer set, or what the glint blends on top — the glint ends up
-     * drawing the same colour it is drawing over. This is the same mechanism
-     * 1.9 added as GlStateManager.enableOutlineMode() for this exact job.
-     *
-     * The constant is read from GL_CURRENT_COLOR, which at this point is still
-     * the colour setScoreTeamColor() set and the body was drawn with, so armor
-     * and body land in the buffer as one region rather than two.
-     *
-     * Raw GL, not GlStateManager, because a no-op is the failure mode here: the
-     * client drives plenty of GL directly and its cache can already disagree
-     * with the driver (forceOutlineBlend exists for that reason). What is
-     * changed is read back first and restored exactly.
+     * EntityRenderer runs the composite after the whole world is drawn, so by
+     * then every player's armor has had its chance to mark.
      */
-    private static void beginArmorSilhouette() {
-        savedBlend = GL11.glIsEnabled(GL11.GL_BLEND);
-        savedAlphaTest = GL11.glIsEnabled(3008);            // GL_ALPHA_TEST
-        savedTexture2D = GL11.glIsEnabled(3553);            // GL_TEXTURE_2D
-
-        SILHOUETTE_COLOR.clear();
+    public static void afterOutlineComposite() {
         try {
-            COLOR_QUERY.clear();
-            GL11.glGetFloat(2816, COLOR_QUERY);             // GL_CURRENT_COLOR
-            SILHOUETTE_COLOR.put(COLOR_QUERY.get(0)).put(COLOR_QUERY.get(1)).put(COLOR_QUERY.get(2));
+            GL11.glStencilMask(255);
+            GL11.glStencilFunc(519, 0, 255);        // GL_ALWAYS — leave it as found
+            GL11.glStencilOp(7680, 7680, 7680);     // KEEP
+            GL11.glDisable(2960);
+            if (armorMaskWritten) {
+                GL11.glClearStencil(0);
+                GL11.glClear(1024);                 // GL_STENCIL_BUFFER_BIT
+                armorMaskWritten = false;
+            }
         } catch (Throwable ignored) {
-            SILHOUETTE_COLOR.clear();
-            SILHOUETTE_COLOR.put(1.0f).put(1.0f).put(1.0f);
-        }
-        SILHOUETTE_COLOR.put(1.0f);                         // opaque, always
-        SILHOUETTE_COLOR.flip();
-
-        GL11.glDisable(GL11.GL_BLEND);
-        GL11.glDisable(3008);                               // GL_ALPHA_TEST — nothing may be cut out
-        // The lightmap unit is off for this whole pass (setScoreTeamColor), so
-        // there is nothing there to modulate what unit 0 produces.
-        OpenGlHelper.setActiveTexture(OpenGlHelper.defaultTexUnit);
-        GL11.glEnable(3553);                                // texturing must be on for the env to apply
-        GL11.glTexEnvi(8960, 8704, OpenGlHelper.GL_COMBINE); // GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE
-        GL11.glTexEnvi(8960, OpenGlHelper.GL_COMBINE_RGB, 7681);              // GL_REPLACE
-        GL11.glTexEnvi(8960, OpenGlHelper.GL_SOURCE0_RGB, OpenGlHelper.GL_CONSTANT);
-        GL11.glTexEnvi(8960, OpenGlHelper.GL_OPERAND0_RGB, 768);              // GL_SRC_COLOR
-        GL11.glTexEnvi(8960, OpenGlHelper.GL_COMBINE_ALPHA, 7681);            // GL_REPLACE
-        GL11.glTexEnvi(8960, OpenGlHelper.GL_SOURCE0_ALPHA, OpenGlHelper.GL_CONSTANT);
-        GL11.glTexEnvi(8960, OpenGlHelper.GL_OPERAND0_ALPHA, 770);            // GL_SRC_ALPHA
-        GL11.glTexEnv(8960, 8705, SILHOUETTE_COLOR);        // GL_TEXTURE_ENV_COLOR
-    }
-
-    /**
-     * Puts back the texture environment MC runs with everywhere else — this is
-     * unsetBrightness()'s own restore, i.e. the game's definition of "normal" —
-     * and then the enable flags that were read in begin.
-     *
-     * Depth goes back through GlStateManager on purpose: the glint path changes
-     * it through GlStateManager too (GL_EQUAL/GL_LEQUAL, depthMask), so the
-     * cache believes GL_LEQUAL by now. The outline pass has more entities to
-     * draw and RenderGlobal set GL_ALWAYS for it; setting it any other way
-     * would leave the cache and the driver disagreeing, and the next
-     * GlStateManager.depthFunc() would then be the no-op that sticks.
-     */
-    private static void endArmorSilhouette() {
-        GL11.glTexEnvi(8960, 8704, OpenGlHelper.GL_COMBINE);
-        GL11.glTexEnvi(8960, OpenGlHelper.GL_COMBINE_RGB, 8448);              // GL_MODULATE
-        GL11.glTexEnvi(8960, OpenGlHelper.GL_SOURCE0_RGB, OpenGlHelper.defaultTexUnit);
-        GL11.glTexEnvi(8960, OpenGlHelper.GL_SOURCE1_RGB, OpenGlHelper.GL_PRIMARY_COLOR);
-        GL11.glTexEnvi(8960, OpenGlHelper.GL_OPERAND0_RGB, 768);
-        GL11.glTexEnvi(8960, OpenGlHelper.GL_OPERAND1_RGB, 768);
-        GL11.glTexEnvi(8960, OpenGlHelper.GL_COMBINE_ALPHA, 8448);
-        GL11.glTexEnvi(8960, OpenGlHelper.GL_SOURCE0_ALPHA, OpenGlHelper.defaultTexUnit);
-        GL11.glTexEnvi(8960, OpenGlHelper.GL_SOURCE1_ALPHA, OpenGlHelper.GL_PRIMARY_COLOR);
-        GL11.glTexEnvi(8960, OpenGlHelper.GL_OPERAND0_ALPHA, 770);
-        GL11.glTexEnvi(8960, OpenGlHelper.GL_OPERAND1_ALPHA, 770);
-
-        if (!savedTexture2D) {
-            GL11.glDisable(3553);
-        }
-        if (savedAlphaTest) {
-            GL11.glEnable(3008);
-        }
-        if (savedBlend) {
-            GL11.glEnable(GL11.GL_BLEND);
-        }
-        GlStateManager.depthMask(true);
-        GlStateManager.depthFunc(519);          // GL_ALWAYS, as RenderGlobal set for this pass
-    }
-
-    /**
-     * renderLayers() needs partialTicks, which is a doRender() parameter and
-     * therefore out of scope at the renderModel() call site the patch rewrites
-     * (the class carries no LocalVariableTable, so javassist cannot name it).
-     *
-     * This is the same float and not an approximation of it: runGameLoop()
-     * renders via entityRenderer.func_181560_a(this.timer.renderPartialTicks),
-     * and nothing writes the field again for the duration of that call, so
-     * every partialTicks handed down the render path is this value.
-     */
-    public static float partialTicks() {
-        try {
-            return Minecraft.getMinecraft().timer.renderPartialTicks;
-        } catch (Throwable ignored) {
-            return 1.0f;
         }
     }
 
