@@ -54,7 +54,7 @@
  * painted over by them, while Minecraft's is composited over the finished
  * frame and so is never hidden at all. That is now a setting, on by default
  * for both, which does change Outline's out-of-the-box look. See
- * stencilOutlineOverLayers() and outlineLayersInVanillaPass().
+ * stencilOutlineOverLayers() and renderOutlineArmor().
  *
  * 2. Peter's isRenderEntityOutlines() equivalent returns true *unconditionally*
  * for Minecraft mode. His client has no OptiFine, so that is safe there.
@@ -80,11 +80,12 @@ import Magic.utils.player.ClientUtils;
 import Magic.utils.render.StencilUtil;
 import java.awt.Color;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.GLAllocation;
 import net.minecraft.client.renderer.GlStateManager;
 import net.minecraft.client.renderer.OpenGlHelper;
 import net.minecraft.client.renderer.Tessellator;
-import net.minecraft.client.renderer.entity.layers.LayerArmorBase;
 import net.minecraft.client.renderer.WorldRenderer;
+import net.minecraft.client.renderer.entity.layers.LayerArmorBase;
 import net.minecraft.client.renderer.vertex.DefaultVertexFormats;
 import net.minecraft.entity.EntityLivingBase;
 import net.minecraft.entity.player.EntityPlayer;
@@ -112,7 +113,7 @@ public class PlayerESP extends Module {
      *
      * The two modes need different mechanisms because they build their
      * silhouette at different points — see stencilOutlineOverLayers() and
-     * outlineLayersInVanillaPass().
+     * renderOutlineArmor().
      */
     private final BoolValue throughArmor = new BoolValue("ThroughArmor", this, true,
             "Show the outline through armor.",
@@ -489,11 +490,9 @@ public class PlayerESP extends Module {
      * held item would also become part of the silhouette, which is not what
      * "same outline, just not through armor" means anyway.
      *
-     * So: armor layers only, with the state forced to write one opaque alpha —
-     * blending off (LayerArmorBase's enchantment glint blends additively),
-     * alpha test off, both texture units off. Colour is left to the layer; the
-     * shader keys on alpha, not colour, and vanilla's team colour is white
-     * anyway.
+     * So: armor layers only, and every fragment of them forced to one flat
+     * opaque colour — see beginArmorSilhouette(), which does that in a way the
+     * layer cannot override.
      */
     public static void renderOutlineArmor(java.util.List<?> layers, EntityLivingBase entity,
                                           float limbSwing, float limbSwingAmount, float partialTicks,
@@ -521,33 +520,112 @@ public class PlayerESP extends Module {
         }
     }
 
+    /** Scratch for reading GL_CURRENT_COLOR — LWJGL wants 16 floats of room. */
+    private static final java.nio.FloatBuffer COLOR_QUERY = GLAllocation.createDirectFloatBuffer(16);
+    /** The colour every armor fragment is forced to. */
+    private static final java.nio.FloatBuffer SILHOUETTE_COLOR = GLAllocation.createDirectFloatBuffer(4);
+
+    private static boolean savedBlend;
+    private static boolean savedAlphaTest;
+    private static boolean savedTexture2D;
+
+    /**
+     * Forces the armor draw to put out one flat opaque colour per fragment,
+     * whatever LayerArmorBase does inside.
+     *
+     * Merely turning texturing off is not enough, and that is what the first
+     * attempt got wrong. LayerArmorBase sets its own glColor per piece (the dye
+     * colour for leather), and for enchanted armor it then draws the glint over
+     * the same model in purple (0.5, 0.25, 0.8) with additive blending — which
+     * is exactly the purple that showed up in the outline, and why the result
+     * did not read as a silhouette any more.
+     *
+     * So instead of trying to stop the layer from choosing colours, this makes
+     * the choice irrelevant: texturing ON, but with the texture environment set
+     * to REPLACE from GL_CONSTANT for both RGB and alpha. Every fragment then
+     * comes out as the constant, no matter what texture is bound, what glColor
+     * the layer set, or what the glint blends on top — the glint ends up
+     * drawing the same colour it is drawing over. This is the same mechanism
+     * 1.9 added as GlStateManager.enableOutlineMode() for this exact job.
+     *
+     * The constant is read from GL_CURRENT_COLOR, which at this point is still
+     * the colour setScoreTeamColor() set and the body was drawn with, so armor
+     * and body land in the buffer as one region rather than two.
+     *
+     * Raw GL, not GlStateManager, because a no-op is the failure mode here: the
+     * client drives plenty of GL directly and its cache can already disagree
+     * with the driver (forceOutlineBlend exists for that reason). What is
+     * changed is read back first and restored exactly.
+     */
     private static void beginArmorSilhouette() {
-        GlStateManager.disableBlend();
-        GlStateManager.disableAlpha();
-        GlStateManager.disableLighting();
-        GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
-        GlStateManager.disableTexture2D();
-        GlStateManager.setActiveTexture(OpenGlHelper.lightmapTexUnit);
-        GlStateManager.disableTexture2D();
-        GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
+        savedBlend = GL11.glIsEnabled(GL11.GL_BLEND);
+        savedAlphaTest = GL11.glIsEnabled(3008);            // GL_ALPHA_TEST
+        savedTexture2D = GL11.glIsEnabled(3553);            // GL_TEXTURE_2D
+
+        SILHOUETTE_COLOR.clear();
+        try {
+            COLOR_QUERY.clear();
+            GL11.glGetFloat(2816, COLOR_QUERY);             // GL_CURRENT_COLOR
+            SILHOUETTE_COLOR.put(COLOR_QUERY.get(0)).put(COLOR_QUERY.get(1)).put(COLOR_QUERY.get(2));
+        } catch (Throwable ignored) {
+            SILHOUETTE_COLOR.clear();
+            SILHOUETTE_COLOR.put(1.0f).put(1.0f).put(1.0f);
+        }
+        SILHOUETTE_COLOR.put(1.0f);                         // opaque, always
+        SILHOUETTE_COLOR.flip();
+
+        GL11.glDisable(GL11.GL_BLEND);
+        GL11.glDisable(3008);                               // GL_ALPHA_TEST — nothing may be cut out
+        // The lightmap unit is off for this whole pass (setScoreTeamColor), so
+        // there is nothing there to modulate what unit 0 produces.
+        OpenGlHelper.setActiveTexture(OpenGlHelper.defaultTexUnit);
+        GL11.glEnable(3553);                                // texturing must be on for the env to apply
+        GL11.glTexEnvi(8960, 8704, OpenGlHelper.GL_COMBINE); // GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE
+        GL11.glTexEnvi(8960, OpenGlHelper.GL_COMBINE_RGB, 7681);              // GL_REPLACE
+        GL11.glTexEnvi(8960, OpenGlHelper.GL_SOURCE0_RGB, OpenGlHelper.GL_CONSTANT);
+        GL11.glTexEnvi(8960, OpenGlHelper.GL_OPERAND0_RGB, 768);              // GL_SRC_COLOR
+        GL11.glTexEnvi(8960, OpenGlHelper.GL_COMBINE_ALPHA, 7681);            // GL_REPLACE
+        GL11.glTexEnvi(8960, OpenGlHelper.GL_SOURCE0_ALPHA, OpenGlHelper.GL_CONSTANT);
+        GL11.glTexEnvi(8960, OpenGlHelper.GL_OPERAND0_ALPHA, 770);            // GL_SRC_ALPHA
+        GL11.glTexEnv(8960, 8705, SILHOUETTE_COLOR);        // GL_TEXTURE_ENV_COLOR
     }
 
     /**
-     * LayerArmorBase's glint path ends on its own depth state (GL_LEQUAL,
-     * depthMask true) rather than the pass's, and the outline pass is not done
-     * — it still has entities to draw, with GL_ALWAYS. Everything is put back
-     * through GlStateManager so its cache does not drift out of sync with GL.
+     * Puts back the texture environment MC runs with everywhere else — this is
+     * unsetBrightness()'s own restore, i.e. the game's definition of "normal" —
+     * and then the enable flags that were read in begin.
+     *
+     * Depth goes back through GlStateManager on purpose: the glint path changes
+     * it through GlStateManager too (GL_EQUAL/GL_LEQUAL, depthMask), so the
+     * cache believes GL_LEQUAL by now. The outline pass has more entities to
+     * draw and RenderGlobal set GL_ALWAYS for it; setting it any other way
+     * would leave the cache and the driver disagreeing, and the next
+     * GlStateManager.depthFunc() would then be the no-op that sticks.
      */
     private static void endArmorSilhouette() {
+        GL11.glTexEnvi(8960, 8704, OpenGlHelper.GL_COMBINE);
+        GL11.glTexEnvi(8960, OpenGlHelper.GL_COMBINE_RGB, 8448);              // GL_MODULATE
+        GL11.glTexEnvi(8960, OpenGlHelper.GL_SOURCE0_RGB, OpenGlHelper.defaultTexUnit);
+        GL11.glTexEnvi(8960, OpenGlHelper.GL_SOURCE1_RGB, OpenGlHelper.GL_PRIMARY_COLOR);
+        GL11.glTexEnvi(8960, OpenGlHelper.GL_OPERAND0_RGB, 768);
+        GL11.glTexEnvi(8960, OpenGlHelper.GL_OPERAND1_RGB, 768);
+        GL11.glTexEnvi(8960, OpenGlHelper.GL_COMBINE_ALPHA, 8448);
+        GL11.glTexEnvi(8960, OpenGlHelper.GL_SOURCE0_ALPHA, OpenGlHelper.defaultTexUnit);
+        GL11.glTexEnvi(8960, OpenGlHelper.GL_SOURCE1_ALPHA, OpenGlHelper.GL_PRIMARY_COLOR);
+        GL11.glTexEnvi(8960, OpenGlHelper.GL_OPERAND0_ALPHA, 770);
+        GL11.glTexEnvi(8960, OpenGlHelper.GL_OPERAND1_ALPHA, 770);
+
+        if (!savedTexture2D) {
+            GL11.glDisable(3553);
+        }
+        if (savedAlphaTest) {
+            GL11.glEnable(3008);
+        }
+        if (savedBlend) {
+            GL11.glEnable(GL11.GL_BLEND);
+        }
         GlStateManager.depthMask(true);
         GlStateManager.depthFunc(519);          // GL_ALWAYS, as RenderGlobal set for this pass
-        GlStateManager.disableBlend();
-        GlStateManager.enableAlpha();
-        GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
-        GlStateManager.disableTexture2D();
-        GlStateManager.setActiveTexture(OpenGlHelper.lightmapTexUnit);
-        GlStateManager.disableTexture2D();
-        GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
     }
 
     /**
