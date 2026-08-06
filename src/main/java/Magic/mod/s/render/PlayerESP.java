@@ -83,6 +83,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.GlStateManager;
 import net.minecraft.client.renderer.OpenGlHelper;
 import net.minecraft.client.renderer.Tessellator;
+import net.minecraft.client.renderer.entity.layers.LayerArmorBase;
 import net.minecraft.client.renderer.WorldRenderer;
 import net.minecraft.client.renderer.vertex.DefaultVertexFormats;
 import net.minecraft.entity.EntityLivingBase;
@@ -453,22 +454,17 @@ public class PlayerESP extends Module {
     }
 
     /**
-     * Minecraft mode, ThroughArmor OFF — render the layers into the entity
-     * outline framebuffer as well.
+     * Minecraft mode, ThroughArmor OFF — add the armor to the entity outline
+     * silhouette for this entity.
      *
      * This mode does not draw anything itself: it rides vanilla's spectator
      * glow pass, which composites its buffer over the finished frame, so its
      * outline is always on top and the only question is what is in the
      * silhouette. Vanilla puts the bare model there and nothing else, which is
      * precisely why the glow runs across armor by default — so ThroughArmor ON
-     * is the untouched vanilla path, and only OFF has to do anything. Adding
-     * the layers to that buffer makes the outline wrap the armor instead.
-     *
-     * setScoreTeamColor() has already disabled both texture units and set a
-     * flat colour for this pass, so the layers land as silhouette rather than
-     * as textured armor.
+     * is the untouched vanilla path, and only OFF has to do anything.
      */
-    public static boolean outlineLayersInVanillaPass(EntityLivingBase entity) {
+    public static boolean armorInVanillaOutline(EntityLivingBase entity) {
         PlayerESP module = active(Mode.Minecraft);
         if (module == null || module.throughArmor.getValue()) {
             return false;
@@ -476,6 +472,82 @@ public class PlayerESP extends Module {
         // Vanilla's own renderLayers() call carries this guard; keep it, so a
         // spectator does not get armor drawn for them here and nowhere else.
         return !(entity instanceof EntityPlayer) || !((EntityPlayer) entity).isSpectator();
+    }
+
+    /**
+     * Puts the armor into the entity outline framebuffer, and nothing else.
+     *
+     * Deliberately not renderLayers(): that draws every layer, and two of them
+     * ruin this buffer. magic_esp_edge.fsh finds edges by comparing the ALPHA
+     * of neighbouring texels, so the silhouette only reads as an outline while
+     * its alpha is uniform — one flat region on a cleared buffer, edges just at
+     * its border. LayerHeldItem and LayerCustomHead both go through
+     * RenderItem, which turns texturing back on (setScoreTeamColor had it off),
+     * and a textured draw writes the texture's alpha: holes and soft edges all
+     * over the inside of the figure, every one of which the shader then draws.
+     * That is the glow painted across the player instead of around them. The
+     * held item would also become part of the silhouette, which is not what
+     * "same outline, just not through armor" means anyway.
+     *
+     * So: armor layers only, with the state forced to write one opaque alpha —
+     * blending off (LayerArmorBase's enchantment glint blends additively),
+     * alpha test off, both texture units off. Colour is left to the layer; the
+     * shader keys on alpha, not colour, and vanilla's team colour is white
+     * anyway.
+     */
+    public static void renderOutlineArmor(java.util.List<?> layers, EntityLivingBase entity,
+                                          float limbSwing, float limbSwingAmount, float partialTicks,
+                                          float ageInTicks, float netHeadYaw, float headPitch, float scale) {
+        if (layers == null || entity == null) {
+            return;
+        }
+        try {
+            beginArmorSilhouette();
+            for (Object layer : layers) {
+                if (!(layer instanceof LayerArmorBase)) {
+                    continue;
+                }
+                try {
+                    ((LayerArmorBase<?>) layer).doRenderLayer(entity, limbSwing, limbSwingAmount,
+                            partialTicks, ageInTicks, netHeadYaw, headPitch, scale);
+                } catch (Throwable ignored) {
+                    // One bad layer must not take down the outline pass: the
+                    // rest of it still has entities to draw.
+                }
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            endArmorSilhouette();
+        }
+    }
+
+    private static void beginArmorSilhouette() {
+        GlStateManager.disableBlend();
+        GlStateManager.disableAlpha();
+        GlStateManager.disableLighting();
+        GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
+        GlStateManager.disableTexture2D();
+        GlStateManager.setActiveTexture(OpenGlHelper.lightmapTexUnit);
+        GlStateManager.disableTexture2D();
+        GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
+    }
+
+    /**
+     * LayerArmorBase's glint path ends on its own depth state (GL_LEQUAL,
+     * depthMask true) rather than the pass's, and the outline pass is not done
+     * — it still has entities to draw, with GL_ALWAYS. Everything is put back
+     * through GlStateManager so its cache does not drift out of sync with GL.
+     */
+    private static void endArmorSilhouette() {
+        GlStateManager.depthMask(true);
+        GlStateManager.depthFunc(519);          // GL_ALWAYS, as RenderGlobal set for this pass
+        GlStateManager.disableBlend();
+        GlStateManager.enableAlpha();
+        GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
+        GlStateManager.disableTexture2D();
+        GlStateManager.setActiveTexture(OpenGlHelper.lightmapTexUnit);
+        GlStateManager.disableTexture2D();
+        GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
     }
 
     /**

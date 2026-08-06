@@ -155,10 +155,10 @@ public class PatchMagic {
      *    still four passes over the bare model — but armor is no longer drawn
      *    on top of it, so the outline stays visible across the armor. Exactly
      *    one of the two placements runs; the module decides which.
-     *  - Minecraft, ThroughArmor off: renderLayers() is called in the
-     *    renderOutlines branch too, so armor joins the silhouette written to
-     *    the entity outline framebuffer and the glow wraps it. On (default)
-     *    leaves that branch exactly as vanilla has it.
+     *  - Minecraft, ThroughArmor off: the armor is drawn into the
+     *    renderOutlines branch too, so it joins the silhouette written to the
+     *    entity outline framebuffer and the glow wraps it instead of crossing
+     *    it. On (default) leaves that branch exactly as vanilla has it.
      */
     private static void patchRendererLivingEntity(ClassPool pool, String outDir) throws Exception {
         CtClass renderer = pool.get("net.minecraft.client.renderer.entity.RendererLivingEntity");
@@ -179,11 +179,15 @@ public class PatchMagic {
                                     // Minecraft mode, ThroughArmor off: this is
                                     // the pass that fills the entity outline
                                     // framebuffer, and vanilla puts only the
-                                    // bare model in it. Adding the layers puts
-                                    // armor into the silhouette, so the outline
-                                    // wraps it instead of crossing it.
-                                    + " if ($0.renderOutlines && " + ESP + ".outlineLayersInVanillaPass($1)) {"
-                                    + "   $0.renderLayers($1, $2, $3, " + ESP + ".partialTicks(), $4, $5, $6, $7);"
+                                    // bare model in it. Adding the armor puts
+                                    // it into the silhouette, so the outline
+                                    // wraps it instead of crossing it. Armor
+                                    // only, and not through renderLayers() —
+                                    // see renderOutlineArmor() for why the
+                                    // other layers wreck this buffer.
+                                    + " if ($0.renderOutlines && " + ESP + ".armorInVanillaOutline($1)) {"
+                                    + "   " + ESP + ".renderOutlineArmor($0.layerRenderers, $1, $2, $3, "
+                                    + ESP + ".partialTicks(), $4, $5, $6, $7);"
                                     + " } }");
                     return;
                 }
