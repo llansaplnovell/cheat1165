@@ -105,6 +105,18 @@ patches/RendererLivingEntity.setScoreTeamColor.md  патч ванилы (тол
 * **`ModulePanel`** — в `rePositionValues()` высота 86 теперь и для
   `COLOR_ALPHA`.
 
+## Сборка готового jar'а
+
+```
+tools/patch-jar.sh primordial.jar primordial-alpha.jar
+```
+
+Скрипт компилирует `src/` с classpath'ом исходного jar'а, патчит байткод
+`RendererLivingEntity` (тот самый хук для режима `Minecraft`) и кладёт всё в
+копию jar'а через `zip` — оригинал не трогается, остальные 18 332 записи и
+манифест (`Main-Class: Start`) остаются как были. Нужны JDK, `zip` и `curl`
+(один раз, за ASM).
+
 ## Размеры
 
 Пикеру с alpha полоса и более длинная подпись съедают 11 px, поэтому

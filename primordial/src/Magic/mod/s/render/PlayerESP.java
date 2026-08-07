@@ -147,6 +147,26 @@ public class PlayerESP extends Module {
         }
     }
 
+    /**
+     * Applies the outline color for the vanilla entity-outline pass (Mode.Minecraft).
+     * Falls through to the team color it was handed when this module is not driving
+     * that pass.
+     *
+     * <p>Replaces the {@code GlStateManager.color(f1, f2, f, 1.0F)} call inside
+     * {@code RendererLivingEntity.setScoreTeamColor} - see
+     * {@code patches/RendererLivingEntity.setScoreTeamColor.md}.
+     */
+    public static void outlineTeamColor(float red, float green, float blue, float alpha, EntityLivingBase entity) {
+        int override = PlayerESP.outlineColorOverride(entity);
+        if (override != 0) {
+            red = (float) (override >> 16 & 0xFF) / 255.0f;
+            green = (float) (override >> 8 & 0xFF) / 255.0f;
+            blue = (float) (override & 0xFF) / 255.0f;
+            alpha = (float) (override >> 24 & 0xFF) / 255.0f;
+        }
+        GlStateManager.color(red, green, blue, alpha);
+    }
+
     private static PlayerESP active(Mode mode) {
         PlayerESP playerESP = instance;
         try {
