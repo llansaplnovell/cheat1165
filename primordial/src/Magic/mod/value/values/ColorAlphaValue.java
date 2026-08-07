@@ -49,14 +49,6 @@ public class ColorAlphaValue extends ColorValue {
     }
 
     @Override
-    public void setValue(Color newValue) {
-        super.setValue(newValue);
-        if (newValue != null) {
-            this.picker().setAlpha(newValue.getAlpha());
-        }
-    }
-
-    @Override
     public Type getType() {
         return Type.COLOR_ALPHA;
     }

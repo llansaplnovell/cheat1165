@@ -17,9 +17,8 @@ import org.lwjgl.input.Mouse;
  *   x+width+27 .. x+width+47      "C" (copy) and "P" (paste) buttons, y+17
  * </pre>
  *
- * <p>Because the alpha strip and the wider hex label eat 11 extra pixels, feed this
- * one a gradient width of 46 where the plain picker gets 68 - both then end at the
- * same screen x. That is what {@code ValuePanel} does for {@code Type.COLOR_ALPHA}.
+ * <p>The square keeps the same size it has in the plain picker; the alpha strip and
+ * the preview box are simply pushed 11px further right to make room for it.
  *
  * <p>Pick this class (through {@code ColorAlphaValue}) for settings where partial
  * transparency makes sense - ESP boxes, HUD backgrounds, tracers. Keep the plain
@@ -65,16 +64,21 @@ public class ColorPickerAlpha extends ColorPicker {
         return String.format("%02X%02X%02X%02X", c.getRed(), c.getGreen(), c.getBlue(), c.getAlpha());
     }
 
+    /**
+     * A color copied from a picker without an alpha strip carries no alpha, and lands
+     * here fully opaque - the transparency is not inherited from whatever was set
+     * before. A copy from another alpha picker keeps its own alpha.
+     */
     @Override
     protected int pasteAlpha(int pastedAlpha, boolean pastedHasAlpha) {
-        return pastedHasAlpha ? pastedAlpha : this.alpha;
+        return pastedHasAlpha ? pastedAlpha : 255;
     }
 
     @Override
-    public void paste() {
-        super.paste();
-        if (this.displayColor != null) {
-            this.alpha = this.displayColor.getAlpha();
+    public void setFromColor(Color color) {
+        super.setFromColor(color);
+        if (color != null) {
+            this.alpha = color.getAlpha();
         }
     }
 

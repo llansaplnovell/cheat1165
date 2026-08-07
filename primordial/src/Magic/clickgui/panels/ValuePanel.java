@@ -32,13 +32,16 @@ import pisi.unitedmeows.eventapi.event.listener.Listener;
 @SuppressWarnings({"rawtypes", "unchecked"})
 public class ValuePanel extends Panel {
 
+    /** Left inset of the gradient inside a color row. */
+    public static final int COLOR_PICKER_X = 3;
     /** Gradient width of a plain color picker - hue strip and hex box follow it. */
     public static final int COLOR_PICKER_WIDTH = 68;
     /**
-     * Gradient width of a picker that also shows the alpha strip. 11px narrower than
-     * {@link #COLOR_PICKER_WIDTH} so both variants end at the same screen x.
+     * Gradient width of a picker that also shows the alpha strip - the same square as
+     * the plain one. The alpha strip and the hex box are pushed 11px further right by
+     * {@code ColorPickerAlpha} to make room for it.
      */
-    public static final int COLOR_ALPHA_PICKER_WIDTH = 46;
+    public static final int COLOR_ALPHA_PICKER_WIDTH = COLOR_PICKER_WIDTH;
     /** Height of both color gradients. */
     public static final int COLOR_PICKER_HEIGHT = 70;
 
@@ -132,7 +135,7 @@ public class ValuePanel extends Panel {
             case COLOR: {
                 ColorValue v = (ColorValue) this.value;
                 GuiSettings.getNormalFont().drawString(this.value.getName() + " : ", (float) ((int) this.x + 2), (float) ((int) this.y - 2), v.getValue());
-                v.picker().draw((int) this.x + 3, (int) this.y + 7, COLOR_PICKER_WIDTH, COLOR_PICKER_HEIGHT, mouseX, mouseY, v.getValue());
+                v.picker().draw((int) this.x + COLOR_PICKER_X, (int) this.y + 7, COLOR_PICKER_WIDTH, COLOR_PICKER_HEIGHT, mouseX, mouseY, v.getValue());
                 break;
             }
             case COLOR_ALPHA: {
@@ -140,7 +143,7 @@ public class ValuePanel extends Panel {
                 Color label = v.getValue();
                 // The label keeps full opacity, otherwise a low alpha would hide the name.
                 GuiSettings.getNormalFont().drawString(this.value.getName() + " : ", (float) ((int) this.x + 2), (float) ((int) this.y - 2), new Color(label.getRed(), label.getGreen(), label.getBlue(), 255));
-                v.picker().draw((int) this.x + 3, (int) this.y + 7, COLOR_ALPHA_PICKER_WIDTH, COLOR_PICKER_HEIGHT, mouseX, mouseY, v.getValue());
+                v.picker().draw((int) this.x + COLOR_PICKER_X, (int) this.y + 7, COLOR_ALPHA_PICKER_WIDTH, COLOR_PICKER_HEIGHT, mouseX, mouseY, v.getValue());
                 break;
             }
             case POSITION: {
@@ -316,9 +319,17 @@ public class ValuePanel extends Panel {
             return (float) mouseX >= this.x + 3.0f && (float) mouseX <= this.x + this.width - 3.0f && (float) mouseY > this.y + 10.0f && (float) mouseY <= this.y + 94.0f;
         }
         if (this.value.getType() == Type.COLOR || this.value.getType() == Type.COLOR_ALPHA) {
-            return (float) mouseX >= this.x + 2.0f && (float) mouseX <= this.x + this.width - 2.0f && (float) mouseY > this.y + 10.0f && (float) mouseY <= this.y + 109.0f;
+            // The hex box and its buttons hang past the panel, so the row has to reach
+            // further right than the panel width - otherwise "C"/"P" never get clicked.
+            return (float) mouseX >= this.x + 2.0f && (float) mouseX <= this.colorWidgetRight() && (float) mouseY > this.y + 10.0f && (float) mouseY <= this.y + 109.0f;
         }
         return (float) mouseX >= this.x && (float) mouseX <= this.x + this.width && (float) mouseY > this.y - 5.0f && (float) mouseY <= this.y + this.height - 5.0f;
+    }
+
+    /** Right edge of a color row: gradient, strips and the preview box with its buttons. */
+    private float colorWidgetRight() {
+        int gradient = this.value.getType() == Type.COLOR_ALPHA ? COLOR_ALPHA_PICKER_WIDTH : COLOR_PICKER_WIDTH;
+        return this.x + COLOR_PICKER_X + ((ColorValue) this.value).picker().totalWidth(gradient);
     }
 
     public boolean isHovered(double x, double y, double width, double height, int mouseX, int mouseY) {

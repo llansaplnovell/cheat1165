@@ -66,8 +66,9 @@ public class ColorValue extends Value<Color> {
             return;
         }
         this.color = newValue;
-        this.picker.color = newValue.getRGB();
-        this.picker.hex = String.format("%06X", newValue.getRGB() & 0xFFFFFF);
+        // Moves the markers and rebuilds the gradient's hue, so a pasted or loaded
+        // color shows up on the picker itself and not just in the preview box.
+        this.picker.setFromColor(newValue);
         this.getModule().onSuffixChange();
     }
 

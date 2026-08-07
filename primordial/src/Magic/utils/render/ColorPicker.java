@@ -2,7 +2,6 @@ package Magic.utils.render;
 
 import Magic.utils.math.Timer;
 import java.awt.Color;
-import java.nio.ByteBuffer;
 import java.util.function.Consumer;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.FontRenderer;
@@ -11,7 +10,6 @@ import net.minecraft.client.renderer.GlStateManager;
 import net.minecraft.client.renderer.Tessellator;
 import net.minecraft.client.renderer.WorldRenderer;
 import net.minecraft.client.renderer.vertex.DefaultVertexFormats;
-import org.lwjgl.BufferUtils;
 import org.lwjgl.input.Mouse;
 import org.lwjgl.opengl.GL11;
 
@@ -26,6 +24,11 @@ import org.lwjgl.opengl.GL11;
  *   x+width+16 .. x+width+36      "C" (copy) and "P" (paste) buttons, y+17
  * </pre>
  *
+ * <p>The picked color is held as hue/saturation/brightness and resolved with
+ * {@link Color#HSBtoRGB}, which is exactly what the square's gouraud quad draws -
+ * so no pixel is ever read back from the framebuffer, and dragging anywhere
+ * (square, hue strip, alpha strip) updates the setting on the same frame.
+ *
  * <p>Use this one when the setting must stay fully opaque (ClickGui color, ...).
  * For a picker that also lets the user choose transparency use
  * {@link ColorPickerAlpha}, which keeps the exact same look and adds one more
@@ -33,6 +36,8 @@ import org.lwjgl.opengl.GL11;
  */
 public class ColorPicker {
 
+    /** Width of the hue strip, and of every strip drawn next to it. */
+    protected static final int STRIP_WIDTH = 10;
     /** Edge length of the small "C" / "P" buttons. */
     protected static final int BUTTON_SIZE = 9;
     /** Distance between the top of the preview box and the top of the buttons. */
@@ -44,15 +49,18 @@ public class ColorPicker {
     public int y;
     public int width;
     public int height;
+    /** Pure hue behind the square's gradient, as RGB - kept for compatibility. */
     public int color;
     protected boolean typing;
     public String hex;
     public Color currentColor;
     protected FontRenderer font;
-    protected int lastMouseX;
-    protected int lastMouseY;
     protected Consumer<ColorPicker> consumer;
     protected boolean dragging;
+
+    protected float hue;
+    protected float saturation;
+    protected float brightness;
 
     /** Last color handed to {@link #draw} - i.e. the value the setting currently holds. */
     protected Color displayColor = Color.WHITE;
@@ -62,8 +70,7 @@ public class ColorPicker {
     public ColorPicker(Consumer<ColorPicker> consumer, int savedColor) {
         this.font = Minecraft.getMinecraft().fontRendererObj;
         this.consumer = consumer;
-        this.color = savedColor;
-        this.displayColor = new Color(savedColor, true);
+        this.setFromColor(new Color(savedColor, true));
     }
 
     /**
@@ -74,14 +81,25 @@ public class ColorPicker {
         this.applier = applier;
     }
 
-    private Color getHoverColor() {
-        ByteBuffer rgb = BufferUtils.createByteBuffer(100);
-        GL11.glReadPixels(Mouse.getX(), Mouse.getY(), 1, 1, 6407, 5121, rgb);
-        Color read = new Color(rgb.get(0) & 0xFF, rgb.get(1) & 0xFF, rgb.get(2) & 0xFF);
-        if (read.getRGB() == -2173) {
-            return read.brighter();
+    /** Moves the markers onto the given color. Used on load, on paste and on setValue. */
+    public void setFromColor(Color color) {
+        if (color == null) {
+            return;
         }
-        return read;
+        float[] hsb = Color.RGBtoHSB(color.getRed(), color.getGreen(), color.getBlue(), null);
+        this.hue = hsb[0];
+        this.saturation = hsb[1];
+        this.brightness = hsb[2];
+        this.displayColor = color;
+        this.syncColor();
+    }
+
+    /** Recomputes the cached RGB fields after hue/saturation/brightness changed. */
+    protected void syncColor() {
+        this.color = Color.HSBtoRGB(this.hue, 1.0f, 1.0f);
+        this.currentValue = Color.HSBtoRGB(this.hue, this.saturation, this.brightness);
+        this.currentColor = new Color(this.currentValue);
+        this.hex = ColorPicker.toHex(this.currentValue);
     }
 
     public void draw(int x, int y, int width, int height, int mouseX, int mouseY, Color currentColor) {
@@ -128,25 +146,45 @@ public class ColorPicker {
         if (currentColor != null) {
             this.displayColor = currentColor;
         }
+        boolean held = isFront && Mouse.isButtonDown(0) && height > 0 && width > 0;
+
+        // Input first, so a drag is already reflected by the gradient drawn below it.
+        int hueLeft = x + width + 1;
+        if (held && mouseX >= hueLeft && mouseX <= hueLeft + STRIP_WIDTH && mouseY >= y && mouseY <= y + height) {
+            float picked = ColorPicker.clamp01((float) (mouseY - y) / (float) height);
+            if (picked != this.hue) {
+                this.hue = picked;
+                this.syncColor();
+                this.fire();
+            }
+        }
+        if (held && this.isHover(mouseX, mouseY)) {
+            this.dragging = true;
+            float pickedSaturation = ColorPicker.clamp01((float) (mouseX - x) / (float) width);
+            float pickedBrightness = 1.0f - ColorPicker.clamp01((float) (mouseY - y) / (float) height);
+            if (pickedSaturation != this.saturation || pickedBrightness != this.brightness) {
+                this.saturation = pickedSaturation;
+                this.brightness = pickedBrightness;
+                this.syncColor();
+                this.fire();
+            }
+        } else if (this.dragging) {
+            this.dragging = false;
+            this.fire();
+        }
+
+        int i = 0;
+        while (i < height) {
+            this.drawRect(hueLeft, (double) y + 1.0 * (double) i, hueLeft + STRIP_WIDTH, (double) y + 1.0 * (double) (i + 1), Color.HSBtoRGB((float) i / (float) height, 1.0f, 1.0f));
+            ++i;
+        }
+        int hueMarkerY = y + Math.round(this.hue * (float) height);
+        this.drawRect(hueLeft, hueMarkerY - 2, hueLeft + STRIP_WIDTH, hueMarkerY - 1, Color.BLACK.getRGB());
+        this.drawRect(hueLeft, hueMarkerY + 1, hueLeft + STRIP_WIDTH, hueMarkerY + 2, Color.BLACK.getRGB());
+
         float f = (float) (this.color >> 16 & 0xFF) / 255.0f;
         float f1 = (float) (this.color >> 8 & 0xFF) / 255.0f;
         float f2 = (float) (this.color & 0xFF) / 255.0f;
-        int i = 0;
-        while (i < height) {
-            this.drawRect(x + width + 1, (double) y + 1.0 * (double) i, x + width + 11, (double) y + 1.0 * (double) (i + 1), Color.HSBtoRGB((float) i / (float) height, 1.0f, 1.0f));
-            if (isFront && Mouse.isButtonDown(0) && mouseX >= x + width + 1 && mouseX <= x + width + 11 && (double) mouseY >= (double) y + 1.0 * (double) i && (double) mouseY <= (double) y + 1.0 * (double) (i + 1)) {
-                this.color = Color.HSBtoRGB((float) i / (float) height, 1.0f, 1.0f);
-            }
-            ++i;
-        }
-        i = 0;
-        while (i < height) {
-            if (this.color == Color.HSBtoRGB((float) i / (float) height, 1.0f, 1.0f)) {
-                this.drawRect(x + width + 1, (double) y + 1.0 * (double) i + 1.0, x + width + 11, (double) y + 1.0 * (double) (i + 1) + 2.0, Color.black.getRGB());
-                this.drawRect(x + width + 1, (double) y + 1.0 * (double) i - 2.0, x + width + 11, (double) y + 1.0 * (double) (i + 1) - 1.0, Color.black.getRGB());
-            }
-            ++i;
-        }
         GlStateManager.enableBlend();
         GL11.glEnable(3042);
         GL11.glShadeModel(7425);
@@ -168,22 +206,9 @@ public class ColorPicker {
         // Strips owned by subclasses (the alpha strip) sit right after the hue strip.
         this.drawExtraStrips(x, y, width, height, mouseX, mouseY, isFront);
 
-        if (isFront && Mouse.isButtonDown(0) && this.isHover(mouseX, mouseY)) {
-            int hoverColor;
-            this.dragging = true;
-            this.currentValue = hoverColor = this.getHoverColor().getRGB();
-            this.currentColor = this.getHoverColor();
-            this.hex = ColorPicker.toHex(hoverColor);
-            this.lastMouseX = mouseX;
-            this.lastMouseY = mouseY;
-        } else if (this.dragging) {
-            this.fire();
-            this.dragging = false;
-        }
-        if (this.hex == null) {
-            this.hex = ColorPicker.toHex(this.currentValue);
-        }
-        RenderUtils.drawBorderedRect(this.lastMouseX - 2, this.lastMouseY - 2, this.lastMouseX + 2, this.lastMouseY + 2, 1.0, this.currentValue, Color.BLACK.getRGB(), true);
+        int markerX = x + Math.round(this.saturation * (float) width);
+        int markerY = y + Math.round((1.0f - this.brightness) * (float) height);
+        RenderUtils.drawBorderedRect(markerX - 2, markerY - 2, markerX + 2, markerY + 2, 1.0, this.currentValue, Color.BLACK.getRGB(), true);
 
         int infoX = x + width + this.infoOffsetX();
         this.drawRect(infoX, y, infoX + this.infoWidth(), y + 14, this.displayColor.getRGB());
@@ -208,13 +233,25 @@ public class ColorPicker {
         return 44;
     }
 
+    /**
+     * Full width of the widget, from the left edge of the gradient to the right edge
+     * of the preview box. Takes the gradient width as an argument so callers can ask
+     * before the first {@link #draw} has recorded it.
+     */
+    public int totalWidth(int gradientWidth) {
+        return gradientWidth + this.infoOffsetX() + this.infoWidth();
+    }
+
     /** Hex label shown in the preview box and put on the clipboard, without the leading '#'. */
     protected String hexLabel() {
-        Color c = this.displayColor != null ? this.displayColor : new Color(this.color, true);
+        Color c = this.displayColor != null ? this.displayColor : this.currentColor;
         return String.format("%02X%02X%02X", c.getRed(), c.getGreen(), c.getBlue());
     }
 
-    /** Alpha kept when a pasted string carries none. Overridden by the alpha picker. */
+    /**
+     * Alpha to keep when a color arrives from the clipboard. A picker without an
+     * alpha strip never changes the alpha it already has.
+     */
     protected int pasteAlpha(int pastedAlpha, boolean pastedHasAlpha) {
         return this.displayColor != null ? this.displayColor.getAlpha() : 255;
     }
@@ -260,7 +297,11 @@ public class ColorPicker {
         return false;
     }
 
-    /** Puts the current color on the system clipboard as "#RRGGBB" (or "#RRGGBBAA"). */
+    /**
+     * Puts the current color on the system clipboard - "#RRGGBB" here, "#RRGGBBAA"
+     * from a picker with an alpha strip. Both forms are understood by both pickers,
+     * so a color can be moved between them.
+     */
     public void copy() {
         GuiScreen.setClipboardString("#" + this.hexLabel());
     }
@@ -274,11 +315,7 @@ public class ColorPicker {
         if (this.applier != null) {
             this.applier.accept(parsed);
         }
-        this.currentColor = parsed;
-        this.currentValue = parsed.getRGB();
-        this.color = parsed.getRGB();
-        this.hex = ColorPicker.toHex(this.currentValue);
-        this.displayColor = parsed;
+        this.setFromColor(parsed);
     }
 
     /** Accepts "#RRGGBB", "RRGGBB", "0xRRGGBB" and the same three with a trailing "AA". */
@@ -314,6 +351,10 @@ public class ColorPicker {
 
     protected static int clamp(int value, int min, int max) {
         return value < min ? min : (value > max ? max : value);
+    }
+
+    protected static float clamp01(float value) {
+        return value < 0.0f ? 0.0f : (value > 1.0f ? 1.0f : value);
     }
 
     /** Null- and leading-zero-safe replacement for Integer.toHexString(rgb).substring(2). */
