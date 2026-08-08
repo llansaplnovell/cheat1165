@@ -9,6 +9,7 @@ import Magic.mod.SkyPvPController;
 import Magic.mod.SkyPvPParticipant;
 import Magic.mod.value.values.BoolValue;
 import Magic.mod.value.values.NumberValue;
+import Magic.utils.player.ClientUtils;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.player.EntityPlayer;
 import pisi.unitedmeows.eventapi.event.listener.Listener;
@@ -19,7 +20,7 @@ implements AutoRechargeParticipant, SkyPvPParticipant {
     public final NumberValue<Float> hp = new NumberValue<Float>("Health", this, Float.valueOf(5.0f), Float.valueOf(1.0f), Float.valueOf(20.0f), Float.valueOf(1.0f), "Health points: 20 HP = 10 hearts, 10 HP = 5 hearts.");
     public final BoolValue autodisable = new BoolValue("AutoDisable", (Module)this, false, "Disables after AutoLeave is triggered.");
     public final BoolValue autorecharge = new BoolValue("AutoRecharge", (Module)this, false, "Enables again after health recovers.");
-    public final BoolValue skypvp = new BoolValue("SkyPvP", (Module)this, false, "Instead of coming back in the lobby: uses the compass, clicks the bow in the menu and enables AutoLeave again inside SkyPvP. Needs AutoRecharge.", () -> this.autorecharge.getValue());
+    public final BoolValue skypvp = new BoolValue("SkyPvP", (Module)this, false, "Uses the compass and clicks the bow in the menu to get back into SkyPvP. With AutoRecharge it runs after the recharge and enables AutoLeave once you are in, without AutoRecharge it just walks you back in after AutoDisable.", () -> this.autorecharge.getValue() != false || this.autodisable.getValue() != false);
     private boolean waitingForRecharge;
     private boolean rechargeLatched;
     private boolean skyRejoinRunning;
@@ -62,15 +63,29 @@ implements AutoRechargeParticipant, SkyPvPParticipant {
         if (!this.autodisable.getValue().booleanValue()) {
             return;
         }
-        if (this.autorecharge.getValue().booleanValue()) {
+        boolean recharge = this.autorecharge.getValue().booleanValue();
+        if (recharge) {
             this.waitingForRecharge = true;
             this.rechargeLatched = true;
         }
         this.disableModule();
+        if (!recharge) {
+            // no recharge to hook into, so SkyPvP starts right here and only walks us back in
+            this.startSkyPvPRejoin();
+        }
     }
 
     @Override
     public void handleAutoRecharge() {
+        if (this.skyRejoinRunning && !SkyPvPController.isBusy(this)) {
+            // watchdog: the controller is not running the sequence anymore, so do not stay parked
+            // on it - pick the recharge back up instead of leaving the module switched off
+            this.skyRejoinRunning = false;
+            if (this.autorecharge.getValue().booleanValue() && !this.isEnabled()) {
+                this.waitingForRecharge = true;
+                this.rechargeLatched = true;
+            }
+        }
         if (!this.autorecharge.getValue().booleanValue()) {
             if (!this.skyRejoinRunning) {
                 this.clearRechargeState();
@@ -78,6 +93,7 @@ implements AutoRechargeParticipant, SkyPvPParticipant {
             return;
         }
         if (this.skyRejoinRunning) {
+            // the controller drives us while it owns the sequence
             return;
         }
         if (!this.waitingForRecharge || this.isEnabled() || !this.hasPlayer()) {
@@ -89,12 +105,24 @@ implements AutoRechargeParticipant, SkyPvPParticipant {
         }
         if (this.rechargeLatched && f > this.threshold()) {
             this.clearRechargeState();
-            if (this.skypvp.getValue().booleanValue() && SkyPvPController.requestRejoin(this)) {
-                this.skyRejoinRunning = true;
+            // SkyPvP takes over the recharge: stay off, get back into the mode, come back there
+            if (this.startSkyPvPRejoin()) {
                 return;
             }
             this.enableModule();
         }
+    }
+
+    /** @return true when the controller took over and this module has to stay off for now. */
+    private boolean startSkyPvPRejoin() {
+        if (this.skyRejoinRunning) {
+            return true;
+        }
+        if (!this.skypvp.getValue().booleanValue() || !SkyPvPController.requestRejoin(this)) {
+            return false;
+        }
+        this.skyRejoinRunning = true;
+        return true;
     }
 
     @Override
@@ -103,19 +131,23 @@ implements AutoRechargeParticipant, SkyPvPParticipant {
     }
 
     @Override
+    public boolean isSkyPvPRejoinReady() {
+        return this.hasPlayer() && this.currentHealth() > 0.0f && this.currentHealth() > this.threshold();
+    }
+
+    @Override
     public void onSkyPvPRejoinFinished(boolean joined) {
         this.skyRejoinRunning = false;
-        if (this.isEnabled()) {
-            this.clearRechargeState();
-            return;
-        }
-        if (this.autorecharge.getValue().booleanValue()) {
-            this.waitingForRecharge = true;
-            this.rechargeLatched = true;
-            return;
-        }
         this.clearRechargeState();
-        this.enableModule();
+        if (this.isEnabled()) {
+            return;
+        }
+        // AutoRecharge asked for the module back, so switch it on here instead of waiting for
+        // another recharge pass - the health it was waiting for is already there.
+        if (this.autorecharge.getValue().booleanValue()) {
+            this.enableModule();
+            ClientUtils.debug("SkyPvP: back in, AutoLeave enabled.");
+        }
     }
 
     public boolean isWaitingForRecharge() {
