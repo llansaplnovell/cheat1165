@@ -148,7 +148,7 @@ extends Render<T> {
                     boolean flag1 = this.setScoreTeamColor((EntityLivingBase)entity);
                     this.renderModel(entity, f6, f5, f7, f2, f8, 0.0625f);
                     if (PlayerESP.outlineArmorLayersWanted((EntityLivingBase)entity)) {
-                        PlayerESP.renderOutlineArmorLayers(this.layerRenderers, (EntityLivingBase)entity, f6, f5, partialTicks, f7, f2, f8, 0.0625f);
+                        PlayerESP.renderOutlineArmorLayers(this.layerRenderers, this.mainModel, (EntityLivingBase)entity, f6, f5, partialTicks, f7, f2, f8, 0.0625f);
                     }
                     if (flag1) {
                         this.unsetScoreTeamColor();
@@ -163,7 +163,7 @@ extends Render<T> {
                     if (!(entity instanceof EntityPlayer) || !((EntityPlayer)entity).isSpectator()) {
                         this.renderLayers(entity, f6, f5, partialTicks, f7, f2, f8, 0.0625f);
                         if (PlayerESP.armorMasksVanillaOutline((EntityLivingBase)entity)) {
-                            PlayerESP.markArmorMask(this.layerRenderers, (EntityLivingBase)entity, f6, f5, partialTicks, f7, f2, f8, 0.0625f);
+                            PlayerESP.markArmorMask(this.layerRenderers, this.mainModel, (EntityLivingBase)entity, f6, f5, partialTicks, f7, f2, f8, 0.0625f);
                         }
                     }
                 }

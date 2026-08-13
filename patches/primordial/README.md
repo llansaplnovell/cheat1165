@@ -51,6 +51,17 @@ Nothing inside the shape can differ from anything else inside the shape, so the 
 exist is the border of the whole shape: the line runs along the first layer and steps out over the
 second one wherever it is actually painted.
 
+## Armor
+
+The armor is not drawn through its layer renderer. An enchanted piece is followed by the
+enchantment glint, and the glint texture is an indexed PNG with no alpha channel at all: nothing
+gets discarded, so the glint stamps the entire armor model — arms, legs and every part the armor
+texture leaves empty — while blending additively on top of it. That is where the oversized angular
+envelope around armored players came from, and why their outline saturated to white. The armor
+models are rendered directly instead, with the real armor textures and no glint, so the silhouette
+is the armor the player actually sees. The same routine feeds the stencil mask used when
+ThroughArmor is off.
+
 ## Settings
 
 - **ThroughArmor** (Minecraft + Outline): when on, the armor layers join the silhouette, so the

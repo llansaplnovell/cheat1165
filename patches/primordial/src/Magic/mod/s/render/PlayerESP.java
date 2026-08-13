@@ -14,8 +14,12 @@ import java.awt.Color;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.model.ModelBase;
+import net.minecraft.client.model.ModelBiped;
 import net.minecraft.client.renderer.GlStateManager;
 import net.minecraft.client.renderer.OpenGlHelper;
 import net.minecraft.client.renderer.RenderHelper;
@@ -28,10 +32,13 @@ import net.minecraft.client.renderer.vertex.DefaultVertexFormats;
 import net.minecraft.client.shader.Framebuffer;
 import net.minecraft.entity.EntityLivingBase;
 import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.item.ItemArmor;
+import net.minecraft.item.ItemStack;
 import net.minecraft.util.AxisAlignedBB;
 import net.minecraft.util.ResourceLocation;
 import optifine.Config;
 import org.lwjgl.opengl.GL11;
+import org.lwjgl.opengl.GL14;
 import org.lwjgl.opengl.GL20;
 import pisi.unitedmeows.eventapi.event.listener.Listener;
 
@@ -52,6 +59,8 @@ extends Module {
     private static final float GLOW_PIXELS_PER_UNIT = 6.0f;
     /** Alpha below this counts as "nothing painted here" for both the alpha test and the shaders. */
     private static final float ALPHA_CUTOFF = 0.02f;
+    /** Texture unit the composite reads the glow from; the world never uses anything past the lightmap. */
+    private static final int GLOW_TEX_UNIT = 2;
 
     /**
      * Draws a target as a flat stamp of one colour: the skin decides only what is kept, the alpha test
@@ -139,6 +148,7 @@ extends Module {
     private static volatile boolean hookRan;
     private static volatile boolean batchActive;
     private static volatile boolean armorMaskWritten;
+    private static final Map<String, ResourceLocation> ARMOR_TEXTURES = new HashMap<String, ResourceLocation>();
 
     public PlayerESP() {
         super("PlayerESP", 0, Category.Render, "Highlights players (Minecraft/Outline/Corner/Box).");
@@ -240,11 +250,10 @@ extends Module {
             GL20.glUniform4f(playerESP.silhouetteColLoc, (float)(n >> 16 & 0xFF) / 255.0f, (float)(n >> 8 & 0xFF) / 255.0f, (float)(n & 0xFF) / 255.0f, (float)(n >> 24 & 0xFF) / 255.0f);
             GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
             GlStateManager.enableTexture2D();
-            // The glint blends additively on top of whatever it covers. Leaving the state manager
-            // convinced blending is on keeps its enableBlend() from reaching the driver, so every
-            // fragment of the silhouette is a plain write.
+            // Blend by taking the maximum: the blend factors stop mattering, so nothing drawn on top of
+            // the silhouette - by a layer or anything else - can brighten it or lower its alpha.
             GlStateManager.enableBlend();
-            GL11.glDisable(3042);
+            GL14.glBlendEquation(32776);
             return true;
         }
         catch (Throwable throwable) {
@@ -257,6 +266,7 @@ extends Module {
             return;
         }
         try {
+            GL14.glBlendEquation(32774);
             GL20.glUseProgram(0);
             GlStateManager.disableBlend();
         }
@@ -302,40 +312,86 @@ extends Module {
     }
 
     /**
-     * Draws the armor layers into the silhouette. Layers restore neither the depth function nor the blend
-     * state after the enchantment glint, so both are put back for the entities rendered afterwards.
+     * Draws the armor into the silhouette. The layers cannot be used for this: an enchanted piece is
+     * followed by the glint, whose texture has no alpha channel at all, so it stamps the whole armor
+     * model - arms, legs and every part the armor texture leaves empty - and blends additively while
+     * doing it. That is where the oversized white envelope around armored players came from. Rendering
+     * the armor models directly keeps the shape the player actually sees.
      */
-    public static void renderOutlineArmorLayers(List<?> list, EntityLivingBase entityLivingBase, float f, float f2, float f3, float f4, float f5, float f6, float f7) {
+    public static void renderOutlineArmorLayers(List<?> list, ModelBase modelBase, EntityLivingBase entityLivingBase, float f, float f2, float f3, float f4, float f5, float f6, float f7) {
         if (list == null || entityLivingBase == null) {
             return;
         }
-        int n = 515;
-        boolean bl = false;
-        try {
-            n = GL11.glGetInteger(2932);
-            bl = GL11.glIsEnabled(3042);
-        }
-        catch (Throwable throwable) {
-            // empty catch block
-        }
-        try {
-            for (Object obj : list) {
-                if (!(obj instanceof LayerArmorBase)) continue;
+        for (Object obj : list) {
+            if (!(obj instanceof LayerArmorBase)) continue;
+            LayerArmorBase layerArmorBase = (LayerArmorBase)obj;
+            for (int i = 4; i >= 1; --i) {
                 try {
-                    ((LayerArmorBase)obj).doRenderLayer(entityLivingBase, f, f2, f3, f4, f5, f6, f7);
+                    PlayerESP.renderArmorPiece(layerArmorBase, modelBase, entityLivingBase, i, f, f2, f3, f4, f5, f6, f7);
                 }
                 catch (Throwable throwable) {}
             }
         }
-        finally {
-            GlStateManager.depthFunc(n);
-            if (bl) {
-                GlStateManager.enableBlend();
-            } else {
-                GlStateManager.disableBlend();
-            }
-            GlStateManager.color(1.0f, 1.0f, 1.0f, 1.0f);
+    }
+
+    private static void renderArmorPiece(LayerArmorBase<?> layerArmorBase, ModelBase modelBase, EntityLivingBase entityLivingBase, int n, float f, float f2, float f3, float f4, float f5, float f6, float f7) {
+        ModelBase modelBase2;
+        ItemStack itemStack = entityLivingBase.getCurrentArmor(n - 1);
+        if (itemStack == null || !(itemStack.getItem() instanceof ItemArmor)) {
+            return;
         }
+        ItemArmor itemArmor = (ItemArmor)itemStack.getItem();
+        ModelBase modelBase3 = modelBase2 = layerArmorBase.func_177175_a(n);
+        if (modelBase2 == null) {
+            return;
+        }
+        if (modelBase != null) {
+            modelBase2.setModelAttributes(modelBase);
+        }
+        modelBase2.setLivingAnimations(entityLivingBase, f, f2, f3);
+        if (modelBase2 instanceof ModelBiped) {
+            PlayerESP.showArmorSlot((ModelBiped)modelBase2, n);
+        }
+        Minecraft.getMinecraft().getTextureManager().bindTexture(PlayerESP.armorTexture(itemArmor, n == 2));
+        modelBase2.render(entityLivingBase, f, f2, f4, f5, f6, f7);
+    }
+
+    /** Same part selection the armor layer uses for each slot. */
+    private static void showArmorSlot(ModelBiped modelBiped, int n) {
+        modelBiped.setInvisible(false);
+        switch (n) {
+            case 1: {
+                modelBiped.bipedRightLeg.showModel = true;
+                modelBiped.bipedLeftLeg.showModel = true;
+                break;
+            }
+            case 2: {
+                modelBiped.bipedBody.showModel = true;
+                modelBiped.bipedRightLeg.showModel = true;
+                modelBiped.bipedLeftLeg.showModel = true;
+                break;
+            }
+            case 3: {
+                modelBiped.bipedBody.showModel = true;
+                modelBiped.bipedRightArm.showModel = true;
+                modelBiped.bipedLeftArm.showModel = true;
+                break;
+            }
+            case 4: {
+                modelBiped.bipedHead.showModel = true;
+                modelBiped.bipedHeadwear.showModel = true;
+            }
+        }
+    }
+
+    private static ResourceLocation armorTexture(ItemArmor itemArmor, boolean bl) {
+        String string = String.format("textures/models/armor/%s_layer_%d.png", itemArmor.getArmorMaterial().getName(), bl ? 2 : 1);
+        ResourceLocation resourceLocation = ARMOR_TEXTURES.get(string);
+        if (resourceLocation == null) {
+            resourceLocation = new ResourceLocation(string);
+            ARMOR_TEXTURES.put(string, resourceLocation);
+        }
+        return resourceLocation;
     }
 
     private static PlayerESP active(Mode mode) {
@@ -499,7 +555,7 @@ extends Module {
     }
 
     /** Stamps the armor into the stencil while the entity is drawn normally, depth tested and all. */
-    public static void markArmorMask(List<?> list, EntityLivingBase entityLivingBase, float f, float f2, float f3, float f4, float f5, float f6, float f7) {
+    public static void markArmorMask(List<?> list, ModelBase modelBase, EntityLivingBase entityLivingBase, float f, float f2, float f3, float f4, float f5, float f6, float f7) {
         if (list == null || entityLivingBase == null) {
             return;
         }
@@ -511,13 +567,7 @@ extends Module {
             GL11.glStencilOp(7680, 7680, 7681);
             GL11.glColorMask(false, false, false, false);
             GlStateManager.depthMask(false);
-            for (Object obj : list) {
-                if (!(obj instanceof LayerArmorBase)) continue;
-                try {
-                    ((LayerArmorBase)obj).doRenderLayer(entityLivingBase, f, f2, f3, f4, f5, f6, f7);
-                }
-                catch (Throwable throwable) {}
-            }
+            PlayerESP.renderOutlineArmorLayers(list, modelBase, entityLivingBase, f, f2, f3, f4, f5, f6, f7);
             armorMaskWritten = true;
         }
         catch (Throwable throwable) {
@@ -532,6 +582,7 @@ extends Module {
 
     private static void clearArmorMask() {
         try {
+            GL14.glBlendEquation(32774);
             GL11.glStencilMask(255);
             GL11.glStencilFunc(519, 0, 255);
             GL11.glStencilOp(7680, 7680, 7680);
@@ -614,22 +665,21 @@ extends Module {
             }
             GL20.glUseProgram(this.outlineProgram);
             GL20.glUniform1i(this.outlineMaskLoc, 0);
-            GL20.glUniform1i(this.outlineGlowLoc, 1);
+            GL20.glUniform1i(this.outlineGlowLoc, GLOW_TEX_UNIT);
             GL20.glUniform2f(this.outlineTexelLoc, 1.0f / (float)this.maskBuffer.framebufferWidth, 1.0f / (float)this.maskBuffer.framebufferHeight);
             GL20.glUniform1f(this.outlineWidthLoc, OUTLINE_WIDTH);
             GL20.glUniform1f(this.outlineAlphaLoc, (float)this.color.getValue().getAlpha() / 255.0f);
             GL20.glUniform1f(this.outlineGlowOnLoc, bl ? 1.0f : 0.0f);
-            // The glow rides on the lightmap unit; put back whatever the world had bound there.
-            GlStateManager.setActiveTexture(OpenGlHelper.lightmapTexUnit);
-            int n4 = GL11.glGetInteger(32873);
+            // A spare texture unit, so neither the world's texture nor its lightmap is disturbed.
+            GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit + GLOW_TEX_UNIT);
             GlStateManager.bindTexture(bl ? this.glowBufferB.framebufferTexture : this.maskBuffer.framebufferTexture);
             GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
             GlStateManager.bindTexture(this.maskBuffer.framebufferTexture);
             PlayerESP.drawTexturedQuad(n2, n3);
             GL20.glUseProgram(0);
             GlStateManager.bindTexture(0);
-            GlStateManager.setActiveTexture(OpenGlHelper.lightmapTexUnit);
-            GlStateManager.bindTexture(n4);
+            GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit + GLOW_TEX_UNIT);
+            GlStateManager.bindTexture(0);
             GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
             if (bl2) {
                 PlayerESP.clearArmorMask();
@@ -723,7 +773,6 @@ extends Module {
     /** State the silhouette is drawn with: no depth, no lighting, no blending, alpha tested. */
     private void beginEspState() {
         GlStateManager.disableLighting();
-        GlStateManager.disableFog();
         GlStateManager.enableTexture2D();
         GlStateManager.disableBlend();
         GlStateManager.enableAlpha();
@@ -736,6 +785,7 @@ extends Module {
 
     private void endEspState(int n, int n2) {
         try {
+            GL14.glBlendEquation(32774);
             GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL11.GL_TEXTURE_ENV_MODE, GL11.GL_MODULATE);
         }
         catch (Throwable throwable) {
