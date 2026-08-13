@@ -9,14 +9,13 @@ import Magic.mod.value.values.EnumValue;
 import Magic.mod.value.values.NumberValue;
 import Magic.utils.Friend.FriendManager;
 import Magic.utils.player.ClientUtils;
+import Magic.utils.render.StencilUtil;
 import java.awt.Color;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.FloatBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.renderer.GLAllocation;
 import net.minecraft.client.renderer.GlStateManager;
 import net.minecraft.client.renderer.OpenGlHelper;
 import net.minecraft.client.renderer.RenderHelper;
@@ -33,7 +32,6 @@ import net.minecraft.util.AxisAlignedBB;
 import net.minecraft.util.ResourceLocation;
 import optifine.Config;
 import org.lwjgl.opengl.GL11;
-import org.lwjgl.opengl.GL13;
 import org.lwjgl.opengl.GL20;
 import pisi.unitedmeows.eventapi.event.listener.Listener;
 
@@ -54,6 +52,15 @@ extends Module {
     private static final float GLOW_PIXELS_PER_UNIT = 6.0f;
     /** Alpha below this counts as "nothing painted here" for both the alpha test and the shaders. */
     private static final float ALPHA_CUTOFF = 0.02f;
+
+    /**
+     * Draws a target as a flat stamp of one colour: the skin decides only what is kept, the alpha test
+     * lives in the shader so the second layer disappears exactly where the game itself draws nothing.
+     * Every fragment then writes the same colour and the same alpha, so no part of the model can ever
+     * become an edge of its own - only the border of the whole shape can.
+     */
+    private static final String SILHOUETTE_VERTEX_SHADER = "#version 120\nvoid main(){gl_Position=gl_ModelViewProjectionMatrix*gl_Vertex;gl_TexCoord[0]=gl_MultiTexCoord0;}\n";
+    private static final String SILHOUETTE_FRAGMENT_SHADER = "#version 120\nuniform sampler2D tex;\nuniform vec4 col;\nvoid main(){if(texture2D(tex,gl_TexCoord[0].xy).a<0.1)discard;gl_FragColor=col;}\n";
 
     private static final String QUAD_VERTEX_SHADER = "#version 120\nvarying vec2 uv;\nvoid main(){gl_Position=gl_ModelViewProjectionMatrix*gl_Vertex;uv=gl_MultiTexCoord0.xy;}\n";
 
@@ -120,14 +127,18 @@ extends Module {
     private int outlineWidthLoc = -1;
     private int outlineAlphaLoc = -1;
     private int outlineGlowOnLoc = -1;
+    private int silhouetteProgram;
+    private int silhouetteTexLoc = -1;
+    private int silhouetteColLoc = -1;
+    private boolean silhouetteFailed;
     private boolean resourcesFailed;
-    private static final FloatBuffer ENV_COLOR = GLAllocation.createDirectFloatBuffer(4);
     private static volatile PlayerESP instance;
     private static volatile String compositeGlState;
     private static volatile boolean sawFramebuffer;
     private static volatile boolean sawShader;
     private static volatile boolean hookRan;
     private static volatile boolean batchActive;
+    private static volatile boolean armorMaskWritten;
 
     public PlayerESP() {
         super("PlayerESP", 0, Category.Render, "Highlights players (Minecraft/Outline/Corner/Box).");
@@ -211,41 +222,29 @@ extends Module {
     }
 
     /**
-     * Keeps the skin texture bound while the silhouette is drawn, with a texture environment that takes the
-     * color from a constant and only the alpha from the skin. Transparent pixels of the second skin layer
-     * are then dropped by the alpha test, so the silhouette hugs the first layer where the second one is
-     * empty and covers the second one where it is painted. The color is constant rather than glColor so
-     * armor layers, which set their own color, cannot tint the silhouette.
+     * Puts the silhouette shader in front of the model while the outline is being built. The colour is
+     * flat and the alpha is constant, so armor layers - which set their own colour and switch blending
+     * back on for the enchantment glint - cannot repaint or fade any part of the shape.
      *
      * @return true when the caller must leave texturing enabled.
      */
     public static boolean outlineSkinAlphaBegin(EntityLivingBase entityLivingBase) {
         PlayerESP playerESP = PlayerESP.outlineOwner();
-        if (playerESP == null) {
+        if (playerESP == null || !playerESP.ensureSilhouetteProgram()) {
             return false;
         }
         try {
             int n = PlayerESP.outlineColorOverride(entityLivingBase);
-            ENV_COLOR.clear();
-            ENV_COLOR.put((float)(n >> 16 & 0xFF) / 255.0f);
-            ENV_COLOR.put((float)(n >> 8 & 0xFF) / 255.0f);
-            ENV_COLOR.put((float)(n & 0xFF) / 255.0f);
-            ENV_COLOR.put((float)(n >> 24 & 0xFF) / 255.0f);
-            ENV_COLOR.flip();
+            GL20.glUseProgram(playerESP.silhouetteProgram);
+            GL20.glUniform1i(playerESP.silhouetteTexLoc, 0);
+            GL20.glUniform4f(playerESP.silhouetteColLoc, (float)(n >> 16 & 0xFF) / 255.0f, (float)(n >> 8 & 0xFF) / 255.0f, (float)(n & 0xFF) / 255.0f, (float)(n >> 24 & 0xFF) / 255.0f);
             GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
             GlStateManager.enableTexture2D();
-            GL11.glTexEnv(GL11.GL_TEXTURE_ENV, GL11.GL_TEXTURE_ENV_COLOR, ENV_COLOR);
-            GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL11.GL_TEXTURE_ENV_MODE, GL13.GL_COMBINE);
-            GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_COMBINE_RGB, GL11.GL_REPLACE);
-            GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_SOURCE0_RGB, GL13.GL_CONSTANT);
-            GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_OPERAND0_RGB, GL11.GL_SRC_COLOR);
-            GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_COMBINE_ALPHA, GL11.GL_MODULATE);
-            GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_SOURCE0_ALPHA, GL11.GL_TEXTURE);
-            GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_OPERAND0_ALPHA, GL11.GL_SRC_ALPHA);
-            GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_SOURCE1_ALPHA, GL13.GL_CONSTANT);
-            GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_OPERAND1_ALPHA, GL11.GL_SRC_ALPHA);
-            GlStateManager.enableAlpha();
-            GlStateManager.alphaFunc(516, ALPHA_CUTOFF);
+            // The glint blends additively on top of whatever it covers. Leaving the state manager
+            // convinced blending is on keeps its enableBlend() from reaching the driver, so every
+            // fragment of the silhouette is a plain write.
+            GlStateManager.enableBlend();
+            GL11.glDisable(3042);
             return true;
         }
         catch (Throwable throwable) {
@@ -258,12 +257,38 @@ extends Module {
             return;
         }
         try {
-            GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
-            GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL11.GL_TEXTURE_ENV_MODE, GL11.GL_MODULATE);
-            GlStateManager.alphaFunc(516, 0.1f);
+            GL20.glUseProgram(0);
+            GlStateManager.disableBlend();
         }
         catch (Throwable throwable) {
             // empty catch block
+        }
+    }
+
+    private boolean ensureSilhouetteProgram() {
+        if (this.silhouetteProgram != 0) {
+            return true;
+        }
+        if (this.silhouetteFailed) {
+            return false;
+        }
+        try {
+            if (!OpenGlHelper.shadersSupported) {
+                this.silhouetteFailed = true;
+                return false;
+            }
+            this.silhouetteProgram = PlayerESP.compileProgram(SILHOUETTE_VERTEX_SHADER, SILHOUETTE_FRAGMENT_SHADER, "silhouette");
+            if (this.silhouetteProgram == 0) {
+                this.silhouetteFailed = true;
+                return false;
+            }
+            this.silhouetteTexLoc = GL20.glGetUniformLocation(this.silhouetteProgram, "tex");
+            this.silhouetteColLoc = GL20.glGetUniformLocation(this.silhouetteProgram, "col");
+            return true;
+        }
+        catch (Throwable throwable) {
+            this.silhouetteFailed = true;
+            return false;
         }
     }
 
@@ -387,6 +412,12 @@ extends Module {
             GL11.glEnable(3042);
             GL11.glBlendFunc(770, 771);
             GL11.glDisable(3008);
+            if (armorMaskWritten) {
+                GL11.glEnable(2960);
+                GL11.glStencilMask(0);
+                GL11.glStencilFunc(517, 1, 255);
+                GL11.glStencilOp(7680, 7680, 7680);
+            }
         }
         catch (Throwable throwable) {
             compositeGlState = "sample failed: " + throwable;
@@ -439,8 +470,85 @@ extends Module {
         return PlayerESP.vanillaOutlineBlocker() == null;
     }
 
+    /** With ThroughArmor off the armor hides the outline, which is what the stencil mask is for. */
+    static boolean armorMaskWanted(EntityLivingBase entityLivingBase) {
+        PlayerESP playerESP = instance;
+        if (playerESP == null || entityLivingBase == null) {
+            return false;
+        }
+        try {
+            if (!playerESP.isEnabled() || playerESP.throughArmor.getValue().booleanValue()) {
+                return false;
+            }
+            Mode mode = (Mode)((Object)playerESP.mode.getValue());
+            if (mode != Mode.Minecraft && mode != Mode.Outline) {
+                return false;
+            }
+            if (!(entityLivingBase instanceof EntityPlayer) || ((EntityPlayer)entityLivingBase).isSpectator()) {
+                return false;
+            }
+            return mode != Mode.Minecraft || PlayerESP.vanillaOutlineHook(sawFramebuffer, sawShader);
+        }
+        catch (Throwable throwable) {
+            return false;
+        }
+    }
+
+    public static boolean armorMasksVanillaOutline(EntityLivingBase entityLivingBase) {
+        return PlayerESP.armorMaskWanted(entityLivingBase);
+    }
+
+    /** Stamps the armor into the stencil while the entity is drawn normally, depth tested and all. */
+    public static void markArmorMask(List<?> list, EntityLivingBase entityLivingBase, float f, float f2, float f3, float f4, float f5, float f6, float f7) {
+        if (list == null || entityLivingBase == null) {
+            return;
+        }
+        try {
+            StencilUtil.checkSetupFBO(Minecraft.getMinecraft().getFramebuffer());
+            GL11.glEnable(2960);
+            GL11.glStencilMask(255);
+            GL11.glStencilFunc(519, 1, 255);
+            GL11.glStencilOp(7680, 7680, 7681);
+            GL11.glColorMask(false, false, false, false);
+            GlStateManager.depthMask(false);
+            for (Object obj : list) {
+                if (!(obj instanceof LayerArmorBase)) continue;
+                try {
+                    ((LayerArmorBase)obj).doRenderLayer(entityLivingBase, f, f2, f3, f4, f5, f6, f7);
+                }
+                catch (Throwable throwable) {}
+            }
+            armorMaskWritten = true;
+        }
+        catch (Throwable throwable) {
+        }
+        finally {
+            GL11.glColorMask(true, true, true, true);
+            GL11.glStencilMask(255);
+            GL11.glDisable(2960);
+            GlStateManager.depthMask(true);
+        }
+    }
+
+    private static void clearArmorMask() {
+        try {
+            GL11.glStencilMask(255);
+            GL11.glStencilFunc(519, 0, 255);
+            GL11.glStencilOp(7680, 7680, 7680);
+            GL11.glDisable(2960);
+            if (armorMaskWritten) {
+                GL11.glClearStencil(0);
+                GL11.glClear(1024);
+                armorMaskWritten = false;
+            }
+        }
+        catch (Throwable throwable) {
+            // empty catch block
+        }
+    }
+
     public static void afterOutlineComposite() {
-        // The Minecraft mode no longer masks anything with the stencil buffer, nothing to undo.
+        PlayerESP.clearArmorMask();
     }
 
     /*
@@ -497,6 +605,13 @@ extends Module {
             GlStateManager.disableAlpha();
             GlStateManager.enableTexture2D();
             GlStateManager.color(1.0f, 1.0f, 1.0f, 1.0f);
+            boolean bl2 = armorMaskWritten;
+            if (bl2) {
+                GL11.glEnable(2960);
+                GL11.glStencilMask(0);
+                GL11.glStencilFunc(517, 1, 255);
+                GL11.glStencilOp(7680, 7680, 7680);
+            }
             GL20.glUseProgram(this.outlineProgram);
             GL20.glUniform1i(this.outlineMaskLoc, 0);
             GL20.glUniform1i(this.outlineGlowLoc, 1);
@@ -516,6 +631,9 @@ extends Module {
             GlStateManager.setActiveTexture(OpenGlHelper.lightmapTexUnit);
             GlStateManager.bindTexture(n4);
             GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
+            if (bl2) {
+                PlayerESP.clearArmorMask();
+            }
         }
         catch (Throwable throwable) {
             this.resourcesFailed = true;
@@ -743,12 +861,17 @@ extends Module {
             if (this.outlineProgram != 0) {
                 GL20.glDeleteProgram(this.outlineProgram);
             }
+            if (this.silhouetteProgram != 0) {
+                GL20.glDeleteProgram(this.silhouetteProgram);
+            }
         }
         catch (Throwable throwable) {
             // empty catch block
         }
         this.blurProgram = 0;
         this.outlineProgram = 0;
+        this.silhouetteProgram = 0;
+        this.silhouetteFailed = false;
         this.resourcesFailed = false;
     }
 

@@ -162,6 +162,9 @@ extends Render<T> {
                     GlStateManager.depthMask(true);
                     if (!(entity instanceof EntityPlayer) || !((EntityPlayer)entity).isSpectator()) {
                         this.renderLayers(entity, f6, f5, partialTicks, f7, f2, f8, 0.0625f);
+                        if (PlayerESP.armorMasksVanillaOutline((EntityLivingBase)entity)) {
+                            PlayerESP.markArmorMask(this.layerRenderers, (EntityLivingBase)entity, f6, f5, partialTicks, f7, f2, f8, 0.0625f);
+                        }
                     }
                 }
                 GlStateManager.disableRescaleNormal();
