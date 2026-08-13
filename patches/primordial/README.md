@@ -1,4 +1,4 @@
-# primordial.jar — PlayerESP patch
+# primordial.jar — PlayerESP / NameTags patch
 
 Sources of the classes patched inside `primordial.jar` (a 1.8.9 client where the vanilla
 classes are shipped deobfuscated, so they can be decompiled, edited and recompiled in place).
@@ -8,44 +8,59 @@ They are kept here because they do not exist anywhere else in source form.
 
 | Class | Why |
 | --- | --- |
-| `Magic/mod/s/render/PlayerESP.java` | Outline mode rewritten as a batched pass, glow added, `Other` mode removed |
-| `net/minecraft/client/renderer/entity/RendererLivingEntity.java` | Silhouette render keeps the skin texture (alpha) bound; hook for the armour mask; the old per-entity outline passes are gone |
+| `Magic/mod/s/render/PlayerESP.java` | Outline mode rebuilt as a screen space pass over the silhouette, glow, `Other` mode removed |
+| `Magic/mod/s/render/NameTags.java` | Absorbed the FishHookNametag module as a setting |
+| `net/minecraft/client/renderer/entity/RendererLivingEntity.java` | Silhouette keeps the skin alpha and can include the armor layers |
+| `Magic/mod/s/render/FHNametag.class` | **deleted from the jar** — modules are found by scanning the package, so removing the class unregisters it |
 
-## What changed
+## How the Outline mode works now
 
-1. **Both skin layers are outlined.** The silhouette used to be drawn with texturing off, so the
-   second skin layer covered the whole model regardless of what the skin actually paints there and
-   the outline sat one pixel off the body. It is now drawn with the skin bound and a texture
-   environment that takes the colour from `glColor` and the alpha from the skin, so the alpha test
-   drops the transparent parts of the second layer. The outline follows the first layer where the
-   second one is empty and steps out over it where it is painted. Applies to Minecraft mode too.
-2. **`Other` mode removed** from the mode list.
-3. **Outline mode merges overlapping players.** Instead of clearing the stencil and outlining each
-   entity on its own, every target is now drawn in one batch from `EventRender3D`: first the merged
-   silhouette into the stencil, then a single wireframe pass clipped to the pixels the silhouette
-   does not cover. Players standing next to each other therefore share one contour, like the
-   Minecraft mode does.
-4. **Glow.** Optional, with a `GlowLength` slider (pixels). The merged silhouette is rendered into a
-   half resolution framebuffer, blurred by a separable gaussian (GLSL program compiled at runtime,
-   as in `WorldParticles`) and blended back over the world with the same blend function. The stencil
-   from the mask pass keeps it strictly outside the players — nothing is shaded under the models.
+The old implementation drew a thick wireframe of the model and cut away the half that fell inside
+the model. A wireframe follows polygon edges, but the visible shape follows the alpha test, so the
+two disagreed wherever a skin's second layer was partly transparent: doubled lines where both
+layers had an edge, and missing segments where the shape stepped between the layers.
 
-`ThroughArmor` still applies to Outline mode: with it off, armour joins the silhouette, so the
-outline wraps the armour instead of cutting through it.
+The line is now derived from the shape itself:
+
+1. every target is drawn once into an offscreen silhouette, colored per player, with the alpha
+   taken from the skin (see below);
+2. optionally the silhouette is blurred at half resolution with a separable gaussian — that is
+   the glow;
+3. one full screen pass turns it into the result: pixels the silhouette covers are discarded, the
+   ring of pixels next to it becomes the line, and the blurred copy fills the rest with the glow.
+
+Because everything comes from one merged silhouette, players who overlap on screen share a single
+contour, the second skin layer can never produce a line of its own, and the glow only ever exists
+outside the players — nothing is shaded underneath the models.
+
+## Skin alpha
+
+The silhouette used to be drawn with texturing off, so the second skin layer covered the whole
+model regardless of what the skin paints there and the outline sat one pixel off the body. It is
+now drawn with the skin bound and a texture environment that takes the color from a constant and
+the alpha from the skin, so the alpha test drops the transparent parts of the second layer. The
+color is constant rather than `glColor` so armor layers, which set their own color, cannot tint
+the silhouette. Applies to Minecraft mode as well.
+
+## Settings
+
+- **ThroughArmor** (Minecraft + Outline): when on, the armor layers join the silhouette, so the
+  line is drawn around the armor too. When off only the bare player model is outlined.
+- **Glow** (Outline) with **GlowLength**: same slider shape as `WorldParticles` (0..20, step 0.05),
+  6 pixels of blur radius per unit, so up to 120 pixels.
+- **FishHookNametag** (NameTags): the former standalone module.
 
 ## Rebuilding
 
 ```sh
-# decompile the two classes (CFR), edit, then:
+# decompile the classes (CFR), edit, then:
 javac -g --release 8 -cp primordial.jar -d out \
     src/Magic/mod/s/render/PlayerESP.java \
+    src/Magic/mod/s/render/NameTags.java \
     src/net/minecraft/client/renderer/entity/RendererLivingEntity.java
 cp primordial.jar primordial-new.jar
-cd out && zip ../primordial-new.jar \
-    'Magic/mod/s/render/PlayerESP.class' \
-    'Magic/mod/s/render/PlayerESP$Mode.class' \
-    'net/minecraft/client/renderer/entity/RendererLivingEntity.class' \
-    'net/minecraft/client/renderer/entity/RendererLivingEntity$RendererLivingEntity$1.class'
+zip -d primordial-new.jar 'Magic/mod/s/render/FHNametag.class'
+cd out && zip ../primordial-new.jar $(find . -name '*.class' | sed 's|^\./||')
 ```
 
 The jar carries `SHA-256-Digest` entries in its manifest but no signature files, so replacing

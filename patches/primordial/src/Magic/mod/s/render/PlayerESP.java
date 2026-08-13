@@ -9,13 +9,14 @@ import Magic.mod.value.values.EnumValue;
 import Magic.mod.value.values.NumberValue;
 import Magic.utils.Friend.FriendManager;
 import Magic.utils.player.ClientUtils;
-import Magic.utils.render.StencilUtil;
 import java.awt.Color;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.FloatBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.GLAllocation;
 import net.minecraft.client.renderer.GlStateManager;
 import net.minecraft.client.renderer.OpenGlHelper;
 import net.minecraft.client.renderer.RenderHelper;
@@ -40,30 +41,35 @@ public class PlayerESP
 extends Module {
     private final EnumValue<Mode> mode = new EnumValue<Mode>("Mode", (Module)this, Mode.class, "ESP render style.");
     private final ColorAlphaValue color = new ColorAlphaValue("Color", (Module)this, new Color(255, 255, 255, 255), "ESP color and transparency.");
-    private final BoolValue throughArmor = new BoolValue("ThroughArmor", this, true, "Show the outline through armor.", () -> this.mode.getValue() == Mode.Outline || this.mode.getValue() == Mode.Minecraft);
+    private final BoolValue throughArmor = new BoolValue("ThroughArmor", this, true, "Outline the armor as well, instead of the bare player model.", () -> this.mode.getValue() == Mode.Outline || this.mode.getValue() == Mode.Minecraft);
     private final BoolValue glow = new BoolValue("Glow", this, false, "Soft glow bleeding outwards from the outline.", () -> this.mode.getValue() == Mode.Outline);
-    private final NumberValue<Float> glowLength = new NumberValue<Float>("GlowLength", this, Float.valueOf(10.0f), Float.valueOf(2.0f), Float.valueOf(40.0f), Float.valueOf(1.0f), "How far the glow reaches past the outline, in pixels.", () -> this.mode.getValue() == Mode.Outline && this.glow.getValue().booleanValue());
+    private final NumberValue<Float> glowLength = new NumberValue<Float>("GlowLength", this, Float.valueOf(4.0f), Float.valueOf(0.0f), Float.valueOf(20.0f), Float.valueOf(0.05f), "Glow size and strength around the outline.", () -> this.mode.getValue() == Mode.Outline && this.glow.getValue().booleanValue());
 
     private static final Color HURT_COLOR = new Color(255, 50, 10, 255);
     private static final Color FRIEND_COLOR = new Color(255, 255, 255, 255);
 
-    /** No batched outline pass is running. */
-    private static final int PASS_NONE = 0;
-    /** Filling the stencil with the merged silhouette of every target. */
-    private static final int PASS_MASK = 1;
-    /** Drawing the outline itself, clipped to everything outside the silhouette. */
-    private static final int PASS_OUTLINE = 2;
-    /** Drawing the silhouette into the offscreen buffer the glow is blurred from. */
-    private static final int PASS_GLOW = 3;
+    /** Outline thickness in pixels, measured outwards from the silhouette. */
+    private static final float OUTLINE_WIDTH = 2.0f;
+    /** Pixels of glow per unit of the GlowLength slider. */
+    private static final float GLOW_PIXELS_PER_UNIT = 6.0f;
+    /** Alpha below this counts as "nothing painted here" for both the alpha test and the shaders. */
+    private static final float ALPHA_CUTOFF = 0.02f;
 
-    /** Stencil value marking "this pixel is covered by a target", i.e. no outline / glow here. */
-    private static final int STENCIL_INSIDE = 8;
-    /** Width of the outline in pixels. Half of the line lands inside the model and is masked away. */
-    private static final float OUTLINE_LINE_WIDTH = 2.0f;
-    /** The blur takes 12 samples to each side; the count is baked into the shader source below. */
+    private static final String QUAD_VERTEX_SHADER = "#version 120\nvarying vec2 uv;\nvoid main(){gl_Position=gl_ModelViewProjectionMatrix*gl_Vertex;uv=gl_MultiTexCoord0.xy;}\n";
 
-    private static final String GLOW_VERTEX_SHADER = "#version 120\nvarying vec2 uv;\nvoid main(){gl_Position=gl_ModelViewProjectionMatrix*gl_Vertex;uv=gl_MultiTexCoord0.xy;}\n";
-    private static final String GLOW_FRAGMENT_SHADER = "#version 120\nuniform sampler2D tex;\nuniform vec2 dir;\nuniform float radius;\nuniform float power;\nuniform float gain;\nuniform float shape;\nvarying vec2 uv;\nvoid main(){vec4 sum=vec4(0.0);float wsum=0.0;for(int i=-12;i<=12;i++){float fi=float(i)/12.0;float w=exp(-2.2*fi*fi);sum+=texture2D(tex,uv+dir*(fi*radius))*w;wsum+=w;}sum/=wsum;if(shape<0.5){gl_FragColor=sum;return;}float a=clamp(pow(clamp(sum.a,0.0,1.0),power)*gain,0.0,1.0);vec3 rgb=sum.a>0.0001?sum.rgb/sum.a:vec3(1.0);gl_FragColor=vec4(rgb,a);}\n";
+    /**
+     * Separable gaussian. The horizontal pass reads the full resolution silhouette and averages two rows
+     * while it writes into the half resolution buffer, so thin players do not fall between the rows.
+     */
+    private static final String BLUR_FRAGMENT_SHADER = "#version 120\nuniform sampler2D tex;\nuniform vec2 dir;\nuniform vec2 extra;\nuniform float radius;\nuniform float gain;\nuniform float shape;\nvarying vec2 uv;\nvoid main(){vec4 sum=vec4(0.0);float wsum=0.0;for(int i=-16;i<=16;i++){float fi=float(i)/16.0;float w=exp(-2.2*fi*fi);vec2 p=uv+dir*(fi*radius);sum+=(texture2D(tex,p)+texture2D(tex,p+extra))*(0.5*w);wsum+=w;}sum/=wsum;if(shape<0.5){gl_FragColor=sum;return;}float a=clamp(sum.a*gain,0.0,1.0);vec3 rgb=sum.a>0.0001?sum.rgb/sum.a:vec3(1.0);gl_FragColor=vec4(rgb,a);}\n";
+
+    /**
+     * Turns the merged silhouette into the outline: everything the silhouette covers is dropped, the ring
+     * of pixels next to it becomes the line, and the blurred copy fills the rest with the glow. Because the
+     * line comes from the silhouette and not from the polygon edges, players that overlap on screen share
+     * one contour and the second skin layer cannot produce a line of its own.
+     */
+    private static final String OUTLINE_FRAGMENT_SHADER = "#version 120\nuniform sampler2D mask;\nuniform sampler2D glowTex;\nuniform vec2 texel;\nuniform float width;\nuniform float espAlpha;\nuniform float glowOn;\nvarying vec2 uv;\nvoid main(){if(texture2D(mask,uv).a>0.02)discard;float best=1000.0;vec3 col=vec3(1.0);for(int i=0;i<12;i++){float ang=0.5235988*float(i);vec2 d=vec2(cos(ang),sin(ang));for(int k=1;k<=2;k++){float r=width*float(k)*0.5;vec4 s=texture2D(mask,uv+d*(r*texel));if(s.a>0.02&&r<best){best=r;col=s.rgb;}}}float outline=best<999.0?clamp(width+0.5-best,0.0,1.0):0.0;vec4 g=glowOn>0.5?texture2D(glowTex,uv):vec4(0.0);float a=max(outline,g.a*(1.0-outline))*espAlpha;if(a<=0.002)discard;gl_FragColor=vec4(outline>0.0?col:g.rgb,a);}\n";
 
     private final Listener<EventRender3D> onRender3D = new Listener<EventRender3D>(eventRender3D -> {
         if (this.mc.theWorld == null || this.mc.thePlayer == null) {
@@ -97,23 +103,31 @@ extends Module {
     });
 
     private Mode reportedMode;
+    private Framebuffer maskBuffer;
     private Framebuffer glowBufferA;
     private Framebuffer glowBufferB;
-    private int glowProgram;
-    private int glowTexLoc = -1;
-    private int glowDirLoc = -1;
-    private int glowRadiusLoc = -1;
-    private int glowPowerLoc = -1;
-    private int glowGainLoc = -1;
-    private int glowShapeLoc = -1;
-    private boolean glowFailed;
+    private int blurProgram;
+    private int blurTexLoc = -1;
+    private int blurDirLoc = -1;
+    private int blurExtraLoc = -1;
+    private int blurRadiusLoc = -1;
+    private int blurGainLoc = -1;
+    private int blurShapeLoc = -1;
+    private int outlineProgram;
+    private int outlineMaskLoc = -1;
+    private int outlineGlowLoc = -1;
+    private int outlineTexelLoc = -1;
+    private int outlineWidthLoc = -1;
+    private int outlineAlphaLoc = -1;
+    private int outlineGlowOnLoc = -1;
+    private boolean resourcesFailed;
+    private static final FloatBuffer ENV_COLOR = GLAllocation.createDirectFloatBuffer(4);
     private static volatile PlayerESP instance;
     private static volatile String compositeGlState;
     private static volatile boolean sawFramebuffer;
     private static volatile boolean sawShader;
     private static volatile boolean hookRan;
-    private static volatile boolean armorMaskWritten;
-    private static volatile int batchPass = 0;
+    private static volatile boolean batchActive;
 
     public PlayerESP() {
         super("PlayerESP", 0, Category.Render, "Highlights players (Minecraft/Outline/Corner/Box).");
@@ -130,7 +144,7 @@ extends Module {
     @Override
     public void onDisable() {
         super.onDisable();
-        this.releaseGlowResources();
+        this.releaseResources();
     }
 
     @Override
@@ -159,15 +173,15 @@ extends Module {
     }
 
     /**
-     * The module that owns the outline currently being drawn: the Minecraft mode hooks into the vanilla
-     * entity outline shader, the Outline mode only owns the entity render while its own batch is running.
+     * The module that owns the silhouette being drawn: the Minecraft mode hooks into the vanilla entity
+     * outline shader, the Outline mode only owns the entity render while its own batch is running.
      */
     private static PlayerESP outlineOwner() {
         PlayerESP playerESP = PlayerESP.active(Mode.Minecraft);
         if (playerESP != null) {
             return playerESP;
         }
-        return batchPass != PASS_NONE ? PlayerESP.active(Mode.Outline) : null;
+        return batchActive ? PlayerESP.active(Mode.Outline) : null;
     }
 
     public static int outlineColorOverride(EntityLivingBase entityLivingBase) {
@@ -177,10 +191,8 @@ extends Module {
         }
         try {
             Color color = playerESP.espColor(entityLivingBase);
-            if (batchPass == PASS_MASK || batchPass == PASS_GLOW) {
-                return PlayerESP.withAlpha(color, 255).getRGB();
-            }
-            return color.getRGB();
+            // The Outline mode applies the transparency when it composites, the silhouette stays opaque.
+            return batchActive ? PlayerESP.withAlpha(color, 255).getRGB() : color.getRGB();
         }
         catch (Throwable throwable) {
             return 0;
@@ -200,30 +212,40 @@ extends Module {
 
     /**
      * Keeps the skin texture bound while the silhouette is drawn, with a texture environment that takes the
-     * colour from glColor and only the alpha from the skin. Transparent pixels of the second skin layer are
-     * then dropped by the alpha test, so the silhouette hugs the first layer where the second one is empty
-     * and steps out over the second layer where it is painted.
+     * color from a constant and only the alpha from the skin. Transparent pixels of the second skin layer
+     * are then dropped by the alpha test, so the silhouette hugs the first layer where the second one is
+     * empty and covers the second one where it is painted. The color is constant rather than glColor so
+     * armor layers, which set their own color, cannot tint the silhouette.
      *
      * @return true when the caller must leave texturing enabled.
      */
     public static boolean outlineSkinAlphaBegin(EntityLivingBase entityLivingBase) {
-        if (PlayerESP.outlineOwner() == null) {
+        PlayerESP playerESP = PlayerESP.outlineOwner();
+        if (playerESP == null) {
             return false;
         }
         try {
+            int n = PlayerESP.outlineColorOverride(entityLivingBase);
+            ENV_COLOR.clear();
+            ENV_COLOR.put((float)(n >> 16 & 0xFF) / 255.0f);
+            ENV_COLOR.put((float)(n >> 8 & 0xFF) / 255.0f);
+            ENV_COLOR.put((float)(n & 0xFF) / 255.0f);
+            ENV_COLOR.put((float)(n >> 24 & 0xFF) / 255.0f);
+            ENV_COLOR.flip();
             GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
             GlStateManager.enableTexture2D();
+            GL11.glTexEnv(GL11.GL_TEXTURE_ENV, GL11.GL_TEXTURE_ENV_COLOR, ENV_COLOR);
             GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL11.GL_TEXTURE_ENV_MODE, GL13.GL_COMBINE);
             GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_COMBINE_RGB, GL11.GL_REPLACE);
-            GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_SOURCE0_RGB, GL13.GL_PRIMARY_COLOR);
+            GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_SOURCE0_RGB, GL13.GL_CONSTANT);
             GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_OPERAND0_RGB, GL11.GL_SRC_COLOR);
             GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_COMBINE_ALPHA, GL11.GL_MODULATE);
             GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_SOURCE0_ALPHA, GL11.GL_TEXTURE);
             GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_OPERAND0_ALPHA, GL11.GL_SRC_ALPHA);
-            GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_SOURCE1_ALPHA, GL13.GL_PRIMARY_COLOR);
+            GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_SOURCE1_ALPHA, GL13.GL_CONSTANT);
             GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL13.GL_OPERAND1_ALPHA, GL11.GL_SRC_ALPHA);
             GlStateManager.enableAlpha();
-            GlStateManager.alphaFunc(516, 0.02f);
+            GlStateManager.alphaFunc(516, ALPHA_CUTOFF);
             return true;
         }
         catch (Throwable throwable) {
@@ -245,28 +267,49 @@ extends Module {
         }
     }
 
-    /** Armour has to join the silhouette while ThroughArmor is off, so the outline stays behind it. */
-    public static boolean outlineArmorMaskWanted(EntityLivingBase entityLivingBase) {
-        if (batchPass != PASS_MASK || entityLivingBase == null) {
-            return false;
-        }
-        PlayerESP playerESP = PlayerESP.active(Mode.Outline);
-        if (playerESP == null || playerESP.throughArmor.getValue().booleanValue()) {
+    /** With ThroughArmor on the armor is part of the outlined shape, so it joins the silhouette. */
+    public static boolean outlineArmorLayersWanted(EntityLivingBase entityLivingBase) {
+        PlayerESP playerESP = PlayerESP.outlineOwner();
+        if (playerESP == null || entityLivingBase == null || !playerESP.throughArmor.getValue().booleanValue()) {
             return false;
         }
         return !(entityLivingBase instanceof EntityPlayer) || !((EntityPlayer)entityLivingBase).isSpectator();
     }
 
-    public static void renderArmorMaskLayers(List<?> list, EntityLivingBase entityLivingBase, float f, float f2, float f3, float f4, float f5, float f6, float f7) {
+    /**
+     * Draws the armor layers into the silhouette. Layers restore neither the depth function nor the blend
+     * state after the enchantment glint, so both are put back for the entities rendered afterwards.
+     */
+    public static void renderOutlineArmorLayers(List<?> list, EntityLivingBase entityLivingBase, float f, float f2, float f3, float f4, float f5, float f6, float f7) {
         if (list == null || entityLivingBase == null) {
             return;
         }
-        for (Object obj : list) {
-            if (!(obj instanceof LayerArmorBase)) continue;
-            try {
-                ((LayerArmorBase)obj).doRenderLayer(entityLivingBase, f, f2, f3, f4, f5, f6, f7);
+        int n = 515;
+        boolean bl = false;
+        try {
+            n = GL11.glGetInteger(2932);
+            bl = GL11.glIsEnabled(3042);
+        }
+        catch (Throwable throwable) {
+            // empty catch block
+        }
+        try {
+            for (Object obj : list) {
+                if (!(obj instanceof LayerArmorBase)) continue;
+                try {
+                    ((LayerArmorBase)obj).doRenderLayer(entityLivingBase, f, f2, f3, f4, f5, f6, f7);
+                }
+                catch (Throwable throwable) {}
             }
-            catch (Throwable throwable) {}
+        }
+        finally {
+            GlStateManager.depthFunc(n);
+            if (bl) {
+                GlStateManager.enableBlend();
+            } else {
+                GlStateManager.disableBlend();
+            }
+            GlStateManager.color(1.0f, 1.0f, 1.0f, 1.0f);
         }
     }
 
@@ -344,12 +387,6 @@ extends Module {
             GL11.glEnable(3042);
             GL11.glBlendFunc(770, 771);
             GL11.glDisable(3008);
-            if (armorMaskWritten) {
-                GL11.glEnable(2960);
-                GL11.glStencilMask(0);
-                GL11.glStencilFunc(517, 1, 255);
-                GL11.glStencilOp(7680, 7680, 7680);
-            }
         }
         catch (Throwable throwable) {
             compositeGlState = "sample failed: " + throwable;
@@ -402,73 +439,17 @@ extends Module {
         return PlayerESP.vanillaOutlineBlocker() == null;
     }
 
-    public static boolean armorMasksVanillaOutline(EntityLivingBase entityLivingBase) {
-        return PlayerESP.armorMaskWanted(entityLivingBase) && PlayerESP.vanillaOutlineHook(sawFramebuffer, sawShader);
-    }
-
-    static boolean armorMaskWanted(EntityLivingBase entityLivingBase) {
-        PlayerESP playerESP = PlayerESP.active(Mode.Minecraft);
-        if (playerESP == null || playerESP.throughArmor.getValue().booleanValue()) {
-            return false;
-        }
-        return !(entityLivingBase instanceof EntityPlayer) || !((EntityPlayer)entityLivingBase).isSpectator();
-    }
-
-    public static void markArmorMask(List<?> list, EntityLivingBase entityLivingBase, float f, float f2, float f3, float f4, float f5, float f6, float f7) {
-        if (list == null || entityLivingBase == null) {
-            return;
-        }
-        try {
-            StencilUtil.checkSetupFBO(Minecraft.getMinecraft().getFramebuffer());
-            GL11.glEnable(2960);
-            GL11.glStencilMask(255);
-            GL11.glStencilFunc(519, 1, 255);
-            GL11.glStencilOp(7680, 7680, 7681);
-            GL11.glColorMask(false, false, false, false);
-            GlStateManager.depthMask(false);
-            for (Object obj : list) {
-                if (!(obj instanceof LayerArmorBase)) continue;
-                try {
-                    ((LayerArmorBase)obj).doRenderLayer(entityLivingBase, f, f2, f3, f4, f5, f6, f7);
-                }
-                catch (Throwable throwable) {}
-            }
-            armorMaskWritten = true;
-        }
-        catch (Throwable throwable) {
-        }
-        finally {
-            GL11.glColorMask(true, true, true, true);
-            GL11.glStencilMask(255);
-            GL11.glDisable(2960);
-            GlStateManager.depthMask(true);
-        }
-    }
-
     public static void afterOutlineComposite() {
-        try {
-            GL11.glStencilMask(255);
-            GL11.glStencilFunc(519, 0, 255);
-            GL11.glStencilOp(7680, 7680, 7680);
-            GL11.glDisable(2960);
-            if (armorMaskWritten) {
-                GL11.glClearStencil(0);
-                GL11.glClear(1024);
-                armorMaskWritten = false;
-            }
-        }
-        catch (Throwable throwable) {
-            // empty catch block
-        }
+        // The Minecraft mode no longer masks anything with the stencil buffer, nothing to undo.
     }
 
     /*
      * ------------------------------------------------------------------------------------------------
      * Outline mode
      *
-     * Every target is drawn in one batch instead of once per entity, so the silhouettes of players that
-     * overlap on screen share a single stencil and the outline follows the border of the whole group
-     * rather than tracing each player separately.
+     * Every target is drawn once into an offscreen silhouette, and the line is then derived from that
+     * silhouette in screen space. Overlapping players therefore share a single contour, and the outline
+     * follows exactly what the alpha test kept - both skin layers - instead of tracing polygon edges.
      * ------------------------------------------------------------------------------------------------
      */
     private void renderOutlineMode(float partialTicks, Frustum frustum) {
@@ -476,60 +457,115 @@ extends Module {
         if (list.isEmpty()) {
             return;
         }
-        Minecraft minecraft = this.mc;
-        RenderManager renderManager = minecraft.getRenderManager();
+        RenderManager renderManager = this.mc.getRenderManager();
         if (renderManager == null) {
             return;
         }
+        int n = 0;
         try {
-            StencilUtil.checkSetupFBO(minecraft.getFramebuffer());
+            n = GL11.glGetInteger(36006);
         }
         catch (Throwable throwable) {
             return;
         }
-        boolean bl = this.glow.getValue().booleanValue();
+        if (!this.ensureResources()) {
+            return;
+        }
+        int n2 = this.mc.displayWidth;
+        int n3 = this.mc.displayHeight;
+        float f = this.glow.getValue() != false ? Math.max(0.0f, ((Float)this.glowLength.getValue()).floatValue()) * GLOW_PIXELS_PER_UNIT : 0.0f;
+        boolean bl = f > 0.5f;
+        batchActive = true;
         renderManager.setRenderOutlines(true);
         try {
             this.beginEspState();
-            GL11.glEnable(2960);
-            GL11.glStencilMask(255);
-            GL11.glClearStencil(0);
-            GL11.glClear(1024);
 
-            // Silhouette of every target, written to the stencil only.
-            batchPass = PASS_MASK;
-            GL11.glPolygonMode(1032, 6914);
-            GL11.glStencilFunc(512, STENCIL_INSIDE, 255);
-            GL11.glStencilOp(7681, 7680, 7680);
-            GlStateManager.colorMask(false, false, false, false);
+            // Merged silhouette of every target, color per player, alpha straight from the skin.
+            this.maskBuffer.framebufferClear();
+            this.maskBuffer.bindFramebuffer(true);
             this.renderTargets(renderManager, list, partialTicks);
-            GlStateManager.colorMask(true, true, true, true);
 
             if (bl) {
-                this.renderGlowLayer(renderManager, list, partialTicks);
+                this.blurSilhouette(f);
             }
 
-            // Outline: a thick wireframe clipped to the pixels the silhouette does not cover, so only the
-            // half of the line that sits outside the merged shape survives.
-            batchPass = PASS_OUTLINE;
-            this.beginEspState();
-            GL11.glEnable(2960);
-            GL11.glStencilMask(255);
-            GL11.glStencilFunc(514, 0, 255);
-            GL11.glStencilOp(7680, 7680, 7682);
-            GL11.glPolygonMode(1032, 6913);
-            GL11.glLineWidth(OUTLINE_LINE_WIDTH);
-            GL11.glEnable(2848);
-            this.renderTargets(renderManager, list, partialTicks);
+            // Derive the line (and the glow) from the silhouette and blend it over the world.
+            OpenGlHelper.glBindFramebuffer(OpenGlHelper.GL_FRAMEBUFFER, n);
+            GlStateManager.viewport(0, 0, n2, n3);
+            GlStateManager.enableBlend();
+            GlStateManager.tryBlendFuncSeparate(770, 771, 1, 1);
+            GlStateManager.disableAlpha();
+            GlStateManager.enableTexture2D();
+            GlStateManager.color(1.0f, 1.0f, 1.0f, 1.0f);
+            GL20.glUseProgram(this.outlineProgram);
+            GL20.glUniform1i(this.outlineMaskLoc, 0);
+            GL20.glUniform1i(this.outlineGlowLoc, 1);
+            GL20.glUniform2f(this.outlineTexelLoc, 1.0f / (float)this.maskBuffer.framebufferWidth, 1.0f / (float)this.maskBuffer.framebufferHeight);
+            GL20.glUniform1f(this.outlineWidthLoc, OUTLINE_WIDTH);
+            GL20.glUniform1f(this.outlineAlphaLoc, (float)this.color.getValue().getAlpha() / 255.0f);
+            GL20.glUniform1f(this.outlineGlowOnLoc, bl ? 1.0f : 0.0f);
+            // The glow rides on the lightmap unit; put back whatever the world had bound there.
+            GlStateManager.setActiveTexture(OpenGlHelper.lightmapTexUnit);
+            int n4 = GL11.glGetInteger(32873);
+            GlStateManager.bindTexture(bl ? this.glowBufferB.framebufferTexture : this.maskBuffer.framebufferTexture);
+            GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
+            GlStateManager.bindTexture(this.maskBuffer.framebufferTexture);
+            PlayerESP.drawTexturedQuad(n2, n3);
+            GL20.glUseProgram(0);
+            GlStateManager.bindTexture(0);
+            GlStateManager.setActiveTexture(OpenGlHelper.lightmapTexUnit);
+            GlStateManager.bindTexture(n4);
+            GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
         }
         catch (Throwable throwable) {
-            // empty catch block
+            this.resourcesFailed = true;
         }
         finally {
-            batchPass = PASS_NONE;
+            batchActive = false;
             renderManager.setRenderOutlines(false);
-            this.endEspState();
+            try {
+                GL20.glUseProgram(0);
+                OpenGlHelper.glBindFramebuffer(OpenGlHelper.GL_FRAMEBUFFER, n);
+            }
+            catch (Throwable throwable) {
+                // empty catch block
+            }
+            this.endEspState(n2, n3);
         }
+    }
+
+    /** Half resolution separable blur of the silhouette, the source the glow is read from. */
+    private void blurSilhouette(float f) {
+        int n = this.glowBufferA.framebufferWidth;
+        int n2 = this.glowBufferA.framebufferHeight;
+        GL20.glUseProgram(this.blurProgram);
+        GL20.glUniform1i(this.blurTexLoc, 0);
+        GlStateManager.disableAlpha();
+        GlStateManager.disableBlend();
+        GlStateManager.enableTexture2D();
+        GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
+        GlStateManager.color(1.0f, 1.0f, 1.0f, 1.0f);
+
+        // horizontal, full resolution source, premultiplied color kept for the second pass
+        this.glowBufferA.bindFramebuffer(true);
+        GL20.glUniform2f(this.blurDirLoc, 1.0f / (float)this.maskBuffer.framebufferWidth, 0.0f);
+        GL20.glUniform2f(this.blurExtraLoc, 0.0f, 1.0f / (float)this.maskBuffer.framebufferHeight);
+        GL20.glUniform1f(this.blurRadiusLoc, f);
+        GL20.glUniform1f(this.blurShapeLoc, 0.0f);
+        GlStateManager.bindTexture(this.maskBuffer.framebufferTexture);
+        PlayerESP.drawTexturedQuad(n, n2);
+
+        // vertical, half resolution source, unpremultiplies and lifts the falloff
+        this.glowBufferB.bindFramebuffer(true);
+        GL20.glUniform2f(this.blurDirLoc, 0.0f, 1.0f / (float)n2);
+        GL20.glUniform2f(this.blurExtraLoc, 0.0f, 0.0f);
+        GL20.glUniform1f(this.blurRadiusLoc, f * 0.5f);
+        GL20.glUniform1f(this.blurGainLoc, 1.7f);
+        GL20.glUniform1f(this.blurShapeLoc, 1.0f);
+        GlStateManager.bindTexture(this.glowBufferA.framebufferTexture);
+        PlayerESP.drawTexturedQuad(n, n2);
+        GL20.glUseProgram(0);
+        GlStateManager.bindTexture(0);
     }
 
     private List<EntityPlayer> collectTargets(Frustum frustum) {
@@ -539,7 +575,7 @@ extends Module {
                 if (entityPlayer == null || entityPlayer == this.mc.thePlayer || entityPlayer.isDead || !entityPlayer.isEntityAlive() || entityPlayer.isInvisible() || entityPlayer.isSpectator()) continue;
                 if (frustum != null) {
                     try {
-                        AxisAlignedBB axisAlignedBB = entityPlayer.getEntityBoundingBox().expand(0.6, 0.6, 0.6);
+                        AxisAlignedBB axisAlignedBB = entityPlayer.getEntityBoundingBox().expand(2.0, 2.0, 2.0);
                         if (!entityPlayer.ignoreFrustumCheck && !frustum.isBoundingBoxInFrustum(axisAlignedBB)) continue;
                     }
                     catch (Throwable throwable) {
@@ -566,37 +602,27 @@ extends Module {
         }
     }
 
-    /** State shared by every pass of the batch: no depth, no lighting, blended, alpha tested. */
+    /** State the silhouette is drawn with: no depth, no lighting, no blending, alpha tested. */
     private void beginEspState() {
         GlStateManager.disableLighting();
         GlStateManager.disableFog();
         GlStateManager.enableTexture2D();
-        GlStateManager.enableBlend();
-        GlStateManager.tryBlendFuncSeparate(770, 771, 1, 0);
+        GlStateManager.disableBlend();
         GlStateManager.enableAlpha();
-        GlStateManager.alphaFunc(516, 0.02f);
+        GlStateManager.alphaFunc(516, ALPHA_CUTOFF);
         GlStateManager.disableDepth();
         GlStateManager.depthMask(false);
+        GlStateManager.colorMask(true, true, true, true);
         GlStateManager.color(1.0f, 1.0f, 1.0f, 1.0f);
     }
 
-    private void endEspState() {
+    private void endEspState(int n, int n2) {
         try {
-            GL11.glStencilMask(255);
-            GL11.glStencilFunc(519, 0, 255);
-            GL11.glStencilOp(7680, 7680, 7680);
-            GL11.glClearStencil(0);
-            GL11.glClear(1024);
-            GL11.glDisable(2960);
-            GL11.glPolygonMode(1032, 6914);
-            GL11.glLineWidth(1.0f);
-            GL11.glDisable(2848);
             GL11.glTexEnvi(GL11.GL_TEXTURE_ENV, GL11.GL_TEXTURE_ENV_MODE, GL11.GL_MODULATE);
         }
         catch (Throwable throwable) {
             // empty catch block
         }
-        GlStateManager.colorMask(true, true, true, true);
         GlStateManager.enableDepth();
         GlStateManager.depthMask(true);
         GlStateManager.depthFunc(515);
@@ -606,99 +632,8 @@ extends Module {
         GlStateManager.alphaFunc(516, 0.1f);
         GlStateManager.enableTexture2D();
         GlStateManager.color(1.0f, 1.0f, 1.0f, 1.0f);
-        GlStateManager.viewport(0, 0, this.mc.displayWidth, this.mc.displayHeight);
+        GlStateManager.viewport(0, 0, n, n2);
         RenderHelper.disableStandardItemLighting();
-    }
-
-    /*
-     * ------------------------------------------------------------------------------------------------
-     * Glow
-     *
-     * The merged silhouette is drawn once into a half resolution buffer, blurred with a separable
-     * gaussian and blended back over the world. The stencil written by the mask pass keeps it strictly
-     * outside the players - nothing is shaded underneath the models.
-     * ------------------------------------------------------------------------------------------------
-     */
-    private void renderGlowLayer(RenderManager renderManager, List<EntityPlayer> list, float partialTicks) {
-        // Read the target the world is being drawn into first: building a framebuffer below unbinds it.
-        int n3 = GL11.glGetInteger(36006);
-        if (!this.ensureGlowResources()) {
-            return;
-        }
-        // Creating a framebuffer also turns the depth test back on, so restore what the batch needs.
-        GlStateManager.disableDepth();
-        GlStateManager.depthMask(false);
-        int n = this.mc.displayWidth;
-        int n2 = this.mc.displayHeight;
-        try {
-            int n4 = this.glowBufferA.framebufferWidth;
-            int n5 = this.glowBufferA.framebufferHeight;
-            float f = Math.max(1.0f, ((Float)this.glowLength.getValue()).floatValue() * 0.5f);
-
-            batchPass = PASS_GLOW;
-            GL11.glDisable(2960);
-            GlStateManager.disableBlend();
-            this.glowBufferA.framebufferClear();
-            this.glowBufferA.bindFramebuffer(true);
-            GL11.glPolygonMode(1032, 6914);
-            this.renderTargets(renderManager, list, partialTicks);
-
-            GL20.glUseProgram(this.glowProgram);
-            GL20.glUniform1i(this.glowTexLoc, 0);
-            GL20.glUniform1f(this.glowRadiusLoc, f);
-            GlStateManager.setActiveTexture(OpenGlHelper.defaultTexUnit);
-            GlStateManager.disableAlpha();
-            GlStateManager.disableBlend();
-            GlStateManager.enableTexture2D();
-            GlStateManager.color(1.0f, 1.0f, 1.0f, 1.0f);
-
-            // horizontal, keeps the colour premultiplied for the second pass
-            this.glowBufferB.bindFramebuffer(true);
-            GL20.glUniform2f(this.glowDirLoc, 1.0f / (float)n4, 0.0f);
-            GL20.glUniform1f(this.glowShapeLoc, 0.0f);
-            this.glowBufferA.bindFramebufferTexture();
-            PlayerESP.drawTexturedQuad(n4, n5);
-
-            // vertical, unpremultiplies and shapes the falloff
-            this.glowBufferA.bindFramebuffer(true);
-            GL20.glUniform2f(this.glowDirLoc, 0.0f, 1.0f / (float)n5);
-            GL20.glUniform1f(this.glowShapeLoc, 1.0f);
-            GL20.glUniform1f(this.glowPowerLoc, 1.35f);
-            GL20.glUniform1f(this.glowGainLoc, 1.45f);
-            this.glowBufferB.bindFramebufferTexture();
-            PlayerESP.drawTexturedQuad(n4, n5);
-            GL20.glUseProgram(0);
-
-            // blend it over the world, everywhere the silhouette did not claim
-            OpenGlHelper.glBindFramebuffer(OpenGlHelper.GL_FRAMEBUFFER, n3);
-            GlStateManager.viewport(0, 0, n, n2);
-            GL11.glEnable(2960);
-            GL11.glStencilMask(0);
-            GL11.glStencilFunc(514, 0, 255);
-            GL11.glStencilOp(7680, 7680, 7680);
-            GlStateManager.enableBlend();
-            GlStateManager.tryBlendFuncSeparate(770, 771, 1, 1);
-            GlStateManager.disableAlpha();
-            GlStateManager.color(1.0f, 1.0f, 1.0f, (float)this.color.getValue().getAlpha() / 255.0f);
-            this.glowBufferA.bindFramebufferTexture();
-            PlayerESP.drawTexturedQuad(n, n2);
-            this.glowBufferA.unbindFramebufferTexture();
-        }
-        catch (Throwable throwable) {
-            this.glowFailed = true;
-        }
-        finally {
-            batchPass = PASS_MASK;
-            try {
-                GL20.glUseProgram(0);
-                OpenGlHelper.glBindFramebuffer(OpenGlHelper.GL_FRAMEBUFFER, n3);
-                GlStateManager.viewport(0, 0, n, n2);
-                GL11.glStencilMask(255);
-            }
-            catch (Throwable throwable) {
-                // empty catch block
-            }
-        }
     }
 
     private static void drawTexturedQuad(double d, double d2) {
@@ -724,88 +659,105 @@ extends Module {
         GlStateManager.popMatrix();
     }
 
-    private boolean ensureGlowResources() {
-        if (this.glowFailed) {
+    private boolean ensureResources() {
+        if (this.resourcesFailed) {
             return false;
         }
         try {
             if (!OpenGlHelper.isFramebufferEnabled() || !OpenGlHelper.shadersSupported || Config.isShaders()) {
-                this.glowFailed = true;
-                ClientUtils.debug((Object)"PlayerESP: Glow needs framebuffers and shader support, they are unavailable right now.");
+                this.resourcesFailed = true;
+                ClientUtils.debug((Object)"PlayerESP: Outline mode needs framebuffers and shader support, they are unavailable right now.");
                 return false;
             }
-            int n = Math.max(1, this.mc.displayWidth / 2);
-            int n2 = Math.max(1, this.mc.displayHeight / 2);
-            if (this.glowBufferA == null || this.glowBufferB == null || this.glowBufferA.framebufferWidth != n || this.glowBufferA.framebufferHeight != n2) {
-                this.deleteGlowBuffers();
-                this.glowBufferA = PlayerESP.createGlowBuffer(n, n2);
-                this.glowBufferB = PlayerESP.createGlowBuffer(n, n2);
+            int n = Math.max(1, this.mc.displayWidth);
+            int n2 = Math.max(1, this.mc.displayHeight);
+            if (this.maskBuffer == null || this.maskBuffer.framebufferWidth != n || this.maskBuffer.framebufferHeight != n2) {
+                this.deleteBuffers();
+                this.maskBuffer = PlayerESP.createBuffer(n, n2, 9728);
+                this.glowBufferA = PlayerESP.createBuffer(Math.max(1, n / 2), Math.max(1, n2 / 2), 9729);
+                this.glowBufferB = PlayerESP.createBuffer(Math.max(1, n / 2), Math.max(1, n2 / 2), 9729);
             }
-            if (this.glowProgram == 0) {
-                this.glowProgram = PlayerESP.compileProgram(GLOW_VERTEX_SHADER, GLOW_FRAGMENT_SHADER);
-                if (this.glowProgram == 0) {
-                    this.glowFailed = true;
-                    ClientUtils.debug((Object)"PlayerESP: Glow shader failed to compile, see the log for details.");
+            if (this.blurProgram == 0) {
+                this.blurProgram = PlayerESP.compileProgram(QUAD_VERTEX_SHADER, BLUR_FRAGMENT_SHADER, "blur");
+                if (this.blurProgram == 0) {
+                    this.resourcesFailed = true;
                     return false;
                 }
-                this.glowTexLoc = GL20.glGetUniformLocation(this.glowProgram, "tex");
-                this.glowDirLoc = GL20.glGetUniformLocation(this.glowProgram, "dir");
-                this.glowRadiusLoc = GL20.glGetUniformLocation(this.glowProgram, "radius");
-                this.glowPowerLoc = GL20.glGetUniformLocation(this.glowProgram, "power");
-                this.glowGainLoc = GL20.glGetUniformLocation(this.glowProgram, "gain");
-                this.glowShapeLoc = GL20.glGetUniformLocation(this.glowProgram, "shape");
+                this.blurTexLoc = GL20.glGetUniformLocation(this.blurProgram, "tex");
+                this.blurDirLoc = GL20.glGetUniformLocation(this.blurProgram, "dir");
+                this.blurExtraLoc = GL20.glGetUniformLocation(this.blurProgram, "extra");
+                this.blurRadiusLoc = GL20.glGetUniformLocation(this.blurProgram, "radius");
+                this.blurGainLoc = GL20.glGetUniformLocation(this.blurProgram, "gain");
+                this.blurShapeLoc = GL20.glGetUniformLocation(this.blurProgram, "shape");
             }
-            return this.glowBufferA != null && this.glowBufferB != null;
+            if (this.outlineProgram == 0) {
+                this.outlineProgram = PlayerESP.compileProgram(QUAD_VERTEX_SHADER, OUTLINE_FRAGMENT_SHADER, "outline");
+                if (this.outlineProgram == 0) {
+                    this.resourcesFailed = true;
+                    return false;
+                }
+                this.outlineMaskLoc = GL20.glGetUniformLocation(this.outlineProgram, "mask");
+                this.outlineGlowLoc = GL20.glGetUniformLocation(this.outlineProgram, "glowTex");
+                this.outlineTexelLoc = GL20.glGetUniformLocation(this.outlineProgram, "texel");
+                this.outlineWidthLoc = GL20.glGetUniformLocation(this.outlineProgram, "width");
+                this.outlineAlphaLoc = GL20.glGetUniformLocation(this.outlineProgram, "espAlpha");
+                this.outlineGlowOnLoc = GL20.glGetUniformLocation(this.outlineProgram, "glowOn");
+            }
+            return this.maskBuffer != null && this.glowBufferA != null && this.glowBufferB != null;
         }
         catch (Throwable throwable) {
-            this.glowFailed = true;
+            this.resourcesFailed = true;
             return false;
         }
     }
 
-    private static Framebuffer createGlowBuffer(int n, int n2) {
+    private static Framebuffer createBuffer(int n, int n2, int n3) {
         Framebuffer framebuffer = new Framebuffer(n, n2, false);
         framebuffer.setFramebufferColor(0.0f, 0.0f, 0.0f, 0.0f);
-        framebuffer.setFramebufferFilter(9729);
+        framebuffer.setFramebufferFilter(n3);
         return framebuffer;
     }
 
-    private void deleteGlowBuffers() {
-        try {
-            if (this.glowBufferA != null) {
-                this.glowBufferA.deleteFramebuffer();
+    private void deleteBuffers() {
+        Framebuffer[] framebufferArray = new Framebuffer[]{this.maskBuffer, this.glowBufferA, this.glowBufferB};
+        for (Framebuffer framebuffer : framebufferArray) {
+            try {
+                if (framebuffer == null) continue;
+                framebuffer.deleteFramebuffer();
             }
-            if (this.glowBufferB != null) {
-                this.glowBufferB.deleteFramebuffer();
+            catch (Throwable throwable) {
+                // empty catch block
             }
         }
-        catch (Throwable throwable) {
-            // empty catch block
-        }
+        this.maskBuffer = null;
         this.glowBufferA = null;
         this.glowBufferB = null;
     }
 
-    private void releaseGlowResources() {
-        this.deleteGlowBuffers();
+    private void releaseResources() {
+        this.deleteBuffers();
         try {
-            if (this.glowProgram != 0) {
-                GL20.glDeleteProgram(this.glowProgram);
+            if (this.blurProgram != 0) {
+                GL20.glDeleteProgram(this.blurProgram);
+            }
+            if (this.outlineProgram != 0) {
+                GL20.glDeleteProgram(this.outlineProgram);
             }
         }
         catch (Throwable throwable) {
             // empty catch block
         }
-        this.glowProgram = 0;
-        this.glowFailed = false;
+        this.blurProgram = 0;
+        this.outlineProgram = 0;
+        this.resourcesFailed = false;
     }
 
-    private static int compileProgram(String string, String string2) {
+    private static int compileProgram(String string, String string2, String string3) {
         int n = GL20.glCreateShader(35633);
         GL20.glShaderSource(n, string);
         GL20.glCompileShader(n);
         if (GL20.glGetShaderi(n, 35713) == 0) {
-            System.err.println("[PlayerESP] Glow vertex shader: " + GL20.glGetShaderInfoLog(n, 4096));
+            System.err.println("[PlayerESP] " + string3 + " vertex shader: " + GL20.glGetShaderInfoLog(n, 4096));
             GL20.glDeleteShader(n);
             return 0;
         }
@@ -813,7 +765,7 @@ extends Module {
         GL20.glShaderSource(n2, string2);
         GL20.glCompileShader(n2);
         if (GL20.glGetShaderi(n2, 35713) == 0) {
-            System.err.println("[PlayerESP] Glow fragment shader: " + GL20.glGetShaderInfoLog(n2, 4096));
+            System.err.println("[PlayerESP] " + string3 + " fragment shader: " + GL20.glGetShaderInfoLog(n2, 4096));
             GL20.glDeleteShader(n);
             GL20.glDeleteShader(n2);
             return 0;
@@ -826,7 +778,7 @@ extends Module {
         GL20.glDeleteShader(n);
         GL20.glDeleteShader(n2);
         if (!bl) {
-            System.err.println("[PlayerESP] Glow program link: " + GL20.glGetProgramInfoLog(n3, 4096));
+            System.err.println("[PlayerESP] " + string3 + " program link: " + GL20.glGetProgramInfoLog(n3, 4096));
             GL20.glDeleteProgram(n3);
             return 0;
         }
