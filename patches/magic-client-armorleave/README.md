@@ -1,64 +1,64 @@
-# ArmorLeave for AutoLeave (Magic client, `primordial.jar`)
+# ArmorLeave (Magic client, `primordial.jar`)
 
-This patch targets the `AutoLeave` module inside the attached compiled client
-(`Magic/mod/s/combat/AutoLeave.class`), not the Forge MDK skeleton the rest of
-this repo builds — the two are unrelated codebases. It's checked in here only
-so the change is versioned and reviewable.
+This targets the compiled client attached to this session
+(`Magic/mod/s/combat/*.class`), not the Forge MDK skeleton the rest of this
+repo builds — the two are unrelated codebases. Checked in here only so the
+change is versioned and reviewable.
 
-## What changed
+## What this is
 
-`AutoLeave` used to trigger only on low health (`Health` value). It now also
-supports armor durability as a second, independent trigger, and every
-dependent behaviour (`AutoDisable`, `AutoRecharge`, `SkyPvP`) has been
-generalized to react to whichever trigger fired instead of only health.
+A brand new module, `ArmorLeave`, sitting next to the existing `AutoLeave`
+module in the `Combat` category. `AutoLeave` itself is **untouched** — same
+class, same behavior, byte-identical `.class` file to the one already in
+`primordial.jar`.
 
-- **`ArmorLeave`** (new `BoolValue`, off by default) — when enabled, AutoLeave
-  also fires the moment *any* currently worn armor piece's remaining
-  durability drops to or below the `Durability` threshold.
-- **`Durability`** (new `NumberValue<Integer>`, default `20`, range `1-100`,
-  only visible while `ArmorLeave` is on) — the durability threshold. Default
-  matches the requested "≤ 20 durability".
-- **`AutoDisable`** — unchanged in behavior, but now disables the module for
-  an armor-durability trigger exactly like it already did for a health
-  trigger.
-- **`AutoRecharge`** — previously re-enabled once `health > Health`. Now
-  re-enables once *every* active trigger has recovered: health is back above
-  its threshold, and, if `ArmorLeave` is on, no worn armor piece is still at
-  or under the durability threshold (e.g. after repairing or swapping in
-  fresh armor).
-- **`SkyPvP`** — the rejoin sequence's "ready" check
-  (`isSkyPvPRejoinReady`) used the same health-only condition; it now uses
-  the same generalized recovery check, so it won't click back in while your
-  armor is still critically damaged.
+`ArmorLeave` mirrors `AutoLeave`'s exact structure (self-attack leave +
+`AutoDisable` + `AutoRecharge` + `SkyPvP`), just built around armor
+durability instead of health:
 
-Implementation detail: the old `currentHealth() > threshold()` /
-`currentHealth() <= threshold()` checks scattered through the module were
-replaced with two helpers, `shouldLeave()` (any trigger active) and
-`isSafeState()` (every enabled trigger has recovered), plus
-`isArmorDurabilityLow()` which scans `mc.thePlayer.inventory.armorInventory`
-(4 slots) for any damageable piece with `getMaxDamage() - getItemDamage() <=
-durabilityThreshold()`. Empty slots don't count against you — nothing to
-protect there, so `ArmorLeave` only reacts to armor you're actually wearing.
+- **`Durability`** (`NumberValue<Integer>`, default `20`, range `1-100`) —
+  the trigger threshold. The module fires (self-attacks, i.e. leaves) the
+  moment any currently worn armor piece's remaining durability
+  (`getMaxDamage() - getItemDamage()`) drops to or below this value. Empty
+  armor slots don't count — only pieces you're actually wearing are checked.
+- **`AutoDisable`** — disables `ArmorLeave` right after it fires, same as
+  `AutoLeave`'s.
+- **`AutoRecharge`** — re-enables `ArmorLeave` once your worn armor's
+  durability is back above the threshold (e.g. after repairing/swapping
+  gear), same latch/wait logic as `AutoLeave`'s.
+- **`SkyPvP`** — same compass/bow rejoin sequence via `SkyPvPController`,
+  gated on armor durability being safe instead of health.
+
+Both modules can run independently and simultaneously (each is a separate
+`Module`, each with its own `AutoDisable`/`AutoRecharge`/`SkyPvP` toggles).
+They share the existing `AutoRechargeController` and `SkyPvPController`
+singletons — those already iterate every registered participant module, so
+no changes were needed there. The one caveat: `SkyPvPController` only runs
+one rejoin sequence at a time, so if both `AutoLeave` and `ArmorLeave` want
+to rejoin in the same moment, whichever asks first wins and the other's
+`requestRejoin` call simply returns `false` (same as it always has for any
+two SkyPvP-participant modules).
 
 ## Files
 
-- `AutoLeave.java` — full patched source, drop-in replacement for
-  `Magic/mod/s/combat/AutoLeave.java`.
-- `AutoLeave.diff` — unified diff against the original decompiled class.
+- `ArmorLeave.java` — full source for the new module.
 
 ## How it was built
 
-1. `Magic/mod/s/combat/AutoLeave.class` (and its sibling classes under
-   `Magic/mod/`) was decompiled from the uploaded `primordial.jar` with CFR
-   0.152 to recover readable source and confirm the existing
-   `AutoDisable`/`AutoRecharge`/`SkyPvP` wiring.
-2. `AutoLeave.java` was rewritten with the `ArmorLeave`/`Durability` values
-   and the generalized trigger/recovery helpers described above.
-3. Recompiled with `javac --release 8 -cp primordial.jar AutoLeave.java` —
-   the class was Java 8 (major version 52), so this reproduces the original
-   bytecode format bit-for-bit compatible with the rest of the jar.
-4. The single recompiled `.class` was swapped back into a copy of the jar
-   with `jar uf`. No other class in the jar was touched.
+1. Decompiled `Magic/mod/s/combat/AutoLeave.java` (and its dependencies
+   under `Magic/mod/`) from `primordial.jar` with CFR 0.152 to use as the
+   template.
+2. Wrote `ArmorLeave.java` as a new top-level class in the same
+   `Magic.mod.s.combat` package, swapping the health check for an armor
+   durability scan of `mc.thePlayer.inventory.armorInventory`.
+3. Compiled with `javac --release 8 -cp primordial.jar ArmorLeave.java` (the
+   client is Java 8 / class file major version 52).
+4. Added the single new `.class` to a copy of the jar with `jar uf`. No
+   other class — `AutoLeave.class` included — was modified.
 
-The rebuilt jar itself isn't committed here (large binary, unrelated to this
+No manual module registration was needed: `Magic.mod.Modules` discovers
+modules by scanning `Magic/mod/s/**` for top-level classes that extend
+`Module`, so `ArmorLeave` is picked up automatically at startup.
+
+The rebuilt jar isn't committed here (large binary, unrelated to this
 repo's Gradle project) — it was sent directly to the user.
