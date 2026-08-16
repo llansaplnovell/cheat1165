@@ -7,6 +7,7 @@ import Magic.mod.Category;
 import Magic.mod.Module;
 import Magic.mod.value.values.BoolValue;
 import Magic.mod.value.values.NumberValue;
+import Magic.utils.Friend.FriendManager;
 import Magic.utils.math.Timer;
 import Magic.utils.player.ClientUtils;
 import net.minecraft.client.Minecraft;
@@ -222,6 +223,13 @@ public class AutoFish extends Module {
      * Same check as isBobberContested(), but returns which sub-check actually fired (or null if
      * neither did) so callers can log it - useful for confirming during testing that a "contested"
      * result really is someone on the line/hook and not a stray false positive.
+     *
+     * Friends (Magic.utils.Friend.FriendManager, the same list KillAura won't attack and MCF
+     * middle-click manages) are skipped rather than treated as a reason to hold the reel - a
+     * friend standing on the line alone never contests it. They're skipped individually inside
+     * the loop, not used to short-circuit the whole check, so a friend and a stranger both being
+     * on the line at once still counts as contested: the stranger is still checked and still
+     * matches, the friend just never gets the chance to match anything themselves.
      */
     private String findContestingReason() {
         if (!this.guard.getValue().booleanValue()) {
@@ -235,7 +243,7 @@ public class AutoFish extends Module {
         Vec3 rodTip = this.mc.thePlayer.getPositionEyes(1.0f);
         Vec3 hookPos = new Vec3(hook.posX, hook.posY, hook.posZ);
         for (EntityPlayer player : ClientUtils.getPlayers()) {
-            if (player == this.mc.thePlayer || player.isDead) {
+            if (player == this.mc.thePlayer || player.isDead || FriendManager.isFriend(player.getName())) {
                 continue;
             }
             if (this.isBlockingLine(player, rodTip, hookPos, range)) {

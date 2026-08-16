@@ -141,6 +141,17 @@ returns *which* check fired and who triggered it, and both
 line is contested (on the line, Steve), holding the reel.` — so it's
 directly visible in chat during testing which of the two checks matched.
 
+**Friends are exempt.** `findContestingReason()` now skips any player
+`Magic.utils.Friend.FriendManager.isFriend(name)` returns true for — the
+same friends list `KillAura` already refuses to target and `MCF`/`NameTags`
+already check against, so this reuses the client's existing friend concept
+rather than adding a second one. The skip happens per-player inside the
+loop (`continue`, not an early return), so it only removes that one friend
+from consideration — it doesn't turn Guard off for the whole tick. A friend
+alone on the line never contests it; a friend and a stranger on the line at
+the same time still contests it, because the stranger is still checked and
+still matches on their own.
+
 ## Files
 
 - `ArmorLeave.java` — full source for the new module.
