@@ -20,13 +20,16 @@ import net.minecraft.network.INetHandler;
 import net.minecraft.network.Packet;
 import net.minecraft.network.play.server.S12PacketEntityVelocity;
 import net.minecraft.network.play.server.S29PacketSoundEffect;
+import net.minecraft.util.AxisAlignedBB;
+import net.minecraft.util.MovingObjectPosition;
+import net.minecraft.util.Vec3;
 import pisi.unitedmeows.eventapi.event.listener.Listener;
 
 public class AutoFish extends Module {
     private BoolValue afk = new BoolValue("Afk", (Module)this, false, "");
     private BoolValue leave = new BoolValue("Leave", (Module)this, false, "Leaves the moment you take any damage while AutoFish is running, even damage the rod itself caused. If a hit doesn't show up as health loss, a drop in worn armor durability is used as a fallback detector. Turns itself back off after firing.");
-    private BoolValue guard = new BoolValue("Guard", (Module)this, false, "Holds off reeling in while another player is standing right next to your bobber, so they can't steal the catch. Reels in automatically the moment they back off.");
-    private NumberValue<Float> guardRange = new NumberValue<Float>("Range", this, 1.0f, 0.5f, 5.0f, 0.5f, "How close another player has to be to your bobber to count as contesting it.", () -> this.guard.getValue() != false);
+    private BoolValue guard = new BoolValue("Guard", (Module)this, false, "Holds off reeling in while another player is standing on or near your fishing line, so they can't steal the catch. Reels in automatically the moment they back off.");
+    private NumberValue<Float> guardRange = new NumberValue<Float>("Range", this, 1.0f, 0.5f, 5.0f, 0.5f, "How close another player's hitbox has to get to your line (or bobber) to count as contesting it.", () -> this.guard.getValue() != false);
     private Timer timer = new Timer();
     private long lastVelTime;
     private int lastAfkTick;
@@ -35,9 +38,11 @@ public class AutoFish extends Module {
     private boolean armorBaselineSet;
     private boolean pendingReel;
     private double pendingReelExtra;
+    private boolean guardContestedLast;
     public Listener<EventPreUpdate> updateEvent = new Listener<EventPreUpdate>(event -> {
         boolean canAfk;
         this.updateLeave();
+        this.updateGuardLog();
         this.updatePendingReel();
         if (!this.isHoldingFishingRod()) {
             this.getOtherRods();
@@ -99,6 +104,7 @@ public class AutoFish extends Module {
     public void onDisable() {
         this.armorBaselineSet = false;
         this.pendingReel = false;
+        this.guardContestedLast = false;
         super.onDisable();
     }
 
@@ -166,9 +172,42 @@ public class AutoFish extends Module {
     }
 
     /**
-     * True while Guard is on, a bobber is actually out, and another player is standing within
-     * guardRange of it - i.e. close enough to also be able to right-click the loot the instant
-     * it lands. Your own player never counts against yourself.
+     * Logs a chat line whenever Guard's contested state flips, purely so it's actually visible
+     * that detection is firing (and when) while testing/tuning Range - the reel itself only
+     * ever reacts on a bite packet or on the per-tick pending-reel retry, so without this it's
+     * easy to stand in a spot that IS being detected and never see any feedback for it.
+     */
+    private void updateGuardLog() {
+        if (this.mc.thePlayer == null) {
+            return;
+        }
+        if (!this.guard.getValue().booleanValue() || this.mc.thePlayer.fishEntity == null) {
+            this.guardContestedLast = false;
+            return;
+        }
+        boolean contested = this.isBobberContested();
+        if (contested == this.guardContestedLast) {
+            return;
+        }
+        this.guardContestedLast = contested;
+        ClientUtils.debug((Object)(contested ? "Guard: line is contested, holding the reel." : "Guard: line is clear again."));
+    }
+
+    /**
+     * The fishing line itself isn't an entity - it's a purely client-side render between the rod
+     * and the hook, with no position/hitbox the server or the client's entity list know about.
+     * So "is someone standing on my line" can't be looked up, it has to be computed: approximate
+     * the line as the straight segment from the rod tip (the local player's eye position is the
+     * closest thing available) to the hook's real position, then test every other player's
+     * actual (padded) hitbox against that segment with vanilla's own ray-vs-AABB routine -
+     * AxisAlignedBB.calculateIntercept, the exact primitive NameTags already uses in this client
+     * to figure out which hook the crosshair is hovering. A plain point-to-point distance check
+     * against just the hook's coordinate would miss anyone standing further back along the line,
+     * which is the case that was reported broken.
+     *
+     * isNearHook() is kept as a belt-and-braces fallback for the one quirk in that routine: a
+     * ray whose start point is already inside the target box can return no intercept, which
+     * would otherwise let someone standing exactly on top of the hook slip through undetected.
      */
     private boolean isBobberContested() {
         if (!this.guard.getValue().booleanValue()) {
@@ -179,15 +218,28 @@ public class AutoFish extends Module {
             return false;
         }
         float range = ((Float)this.guardRange.getValue()).floatValue();
+        Vec3 rodTip = this.mc.thePlayer.getPositionEyes(1.0f);
+        Vec3 hookPos = new Vec3(hook.posX, hook.posY, hook.posZ);
         for (EntityPlayer player : ClientUtils.getPlayers()) {
             if (player == this.mc.thePlayer || player.isDead) {
                 continue;
             }
-            if (player.getDistanceToEntity(hook) < range) {
+            if (this.isNearHook(player, hook, range) || this.isBlockingLine(player, rodTip, hookPos, range)) {
                 return true;
             }
         }
         return false;
+    }
+
+    private boolean isNearHook(EntityPlayer player, EntityFishHook hook, float range) {
+        AxisAlignedBB reach = hook.getEntityBoundingBox().expand((double)range, (double)range, (double)range);
+        return reach.intersectsWith(player.getEntityBoundingBox());
+    }
+
+    private boolean isBlockingLine(EntityPlayer player, Vec3 rodTip, Vec3 hookPos, float range) {
+        AxisAlignedBB reach = player.getEntityBoundingBox().expand((double)range, (double)range, (double)range);
+        MovingObjectPosition intercept = reach.calculateIntercept(rodTip, hookPos);
+        return intercept != null && intercept.hitVec != null;
     }
 
     private void pullBack(double additionalValue) {

@@ -74,8 +74,9 @@ two SkyPvP-participant modules).
 `AutoFish` also gained a `Guard` `BoolValue` (off by default) plus a
 `Range` `NumberValue<Float>` (default `1.0`, `0.5-5.0`, only shown while
 `Guard` is on): while enabled, AutoFish won't reel in as long as another
-player is standing within `Range` blocks of the bobber (`mc.thePlayer.fishEntity`)
-- close enough to right-click the loot themselves the instant it lands.
+player is standing on or near your **fishing line** - not just at the
+bobber - close enough that they could grab the loot themselves the instant
+it lands.
 
 This isn't a hard cancel — `pullBack()` (triggered by the bite packets in
 `onReceive`, both the hook velocity packet and the splash-sound path) checks
@@ -88,11 +89,42 @@ so the catch is still grabbed the instant the area clears, rather than
 being lost because the one bite packet that would have triggered a normal
 reel already passed. If the hook itself disappears while still pending
 (catch missed, line timed out, etc.) the pending state is just dropped.
-`isBobberContested()` walks `ClientUtils.getPlayers()` and skips the local
-player, so it never blocks on itself. The original reel body (the
-afk-aware double right-click + debug log) was factored out into `reelIn()`
-so both the immediate and the deferred path share it instead of duplicating
-the logic.
+The original reel body (the afk-aware double right-click + debug log) was
+factored out into `reelIn()` so both the immediate and the deferred path
+share it instead of duplicating the logic.
+
+**Detection, revised.** The first version checked distance to the hook
+entity only, and that's not what the line actually is: the fishing line
+itself isn't an entity — it's a purely client-side render between the rod
+and the hook, with no position or hitbox the client's entity list knows
+about, so "is someone standing on my line" can't be looked up, only
+computed. `isBobberContested()` now does that directly:
+
+- Approximates the line as the straight segment from the rod tip (the
+  local player's eye position, `getPositionEyes(1.0f)`, is the closest
+  thing available to a rod-tip position) to the hook's real coordinates.
+- For every other player (`ClientUtils.getPlayers()`, local player always
+  skipped), tests their actual bounding box — expanded by `Range` — against
+  that segment using `AxisAlignedBB.calculateIntercept`, vanilla's own
+  ray-vs-box routine. This is the exact primitive `NameTags` already uses
+  in this client to figure out which hook the crosshair is hovering, just
+  pointed at players instead of the mouse ray. This is what catches someone
+  standing partway along the line rather than only right on the bobber.
+- `isNearHook()` — the hook's own box expanded by `Range`, checked for
+  overlap with the player's box — is kept as a belt-and-braces fallback for
+  one quirk in `calculateIntercept`: a ray whose start point is already
+  inside the target box can come back with no intercept, which would
+  otherwise let someone standing exactly on top of the hook slip through.
+  `isBobberContested()` is true if either check hits.
+- `updateGuardLog()` runs once a tick and prints a chat line
+  (`ClientUtils.debug`) whenever the contested state flips, purely so the
+  detection is visible while testing/tuning `Range` instead of only
+  inferring it from whether a reel got delayed.
+
+One thing worth flagging for testing: the local player is always excluded
+from the contest check (guarding against yourself makes no sense), so
+standing at your own bobber solo won't trigger anything — it needs a
+second character/account nearby to actually verify.
 
 ## Files
 
