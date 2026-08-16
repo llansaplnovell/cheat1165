@@ -46,10 +46,16 @@ two SkyPvP-participant modules).
 
 - Runs every tick the module is enabled (not just while a rod is out),
   driven from the module's existing `updateEvent` listener.
-- **Primary detector:** any drop in `mc.thePlayer.getHealth()` between two
-  ticks. This doesn't check the damage source, so it also catches damage
-  the fishing rod itself causes.
-- **Fallback detector:** in case a hit doesn't show up as a health drop, a
+- **Primary detector:** `mc.thePlayer.hurtTime > 0` — vanilla's own "just
+  got hit" flag (same signal `AntiKnockBack`/`PlayerESP` already read in
+  this client). Set the instant a hit registers, regardless of cause, so it
+  also catches damage the fishing rod itself causes, and it doesn't miss
+  hits absorbed before health visibly changes. (Originally this used a
+  tick-over-tick `getHealth()` diff; switched to `hurtTime` after comparing
+  against another client's AutoFish, which uses the same vanilla flag —
+  it's the more standard/reliable signal and was already in use elsewhere
+  in this codebase.)
+- **Fallback detector:** in case a hit doesn't set `hurtTime`, a
   tick-over-tick increase in `getItemDamage()` on any of the 4 worn armor
   slots (i.e. durability going down) is treated as a hit too — armor only
   takes damage when you do.

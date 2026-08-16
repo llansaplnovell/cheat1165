@@ -27,7 +27,6 @@ public class AutoFish extends Module {
     private long lastVelTime;
     private int lastAfkTick;
     private double prevY;
-    private float lastHealth = -1.0f;
     private final int[] lastArmorDamage = new int[4];
     private boolean armorBaselineSet;
     public Listener<EventPreUpdate> updateEvent = new Listener<EventPreUpdate>(event -> {
@@ -91,31 +90,29 @@ public class AutoFish extends Module {
 
     @Override
     public void onDisable() {
-        this.lastHealth = -1.0f;
         this.armorBaselineSet = false;
         super.onDisable();
     }
 
     /**
      * Watches for any damage taken while AutoFish is running and leaves the moment it sees one.
-     * Health loss is the primary detector - it doesn't care what caused it, so it also covers
-     * damage dealt by the fishing rod itself. As a fallback, in case a hit doesn't register as
-     * health loss, a tick-over-tick drop in any worn armor piece's durability is treated as a
-     * hit too. Fires at most once per arm: once it leaves, it turns the Leave toggle back off
-     * itself instead of relying on a separate AutoDisable setting.
+     * The primary detector is vanilla's own hurtTime (set to > 0 the instant the client
+     * registers a hit, same signal AntiKnockBack/PlayerESP already key off) - it doesn't care
+     * what caused the hit, so it also covers damage dealt by the fishing rod itself, and it
+     * doesn't miss hits that get absorbed before visibly changing health. As a fallback, in
+     * case a hit doesn't set hurtTime, a tick-over-tick drop in any worn armor piece's
+     * durability is treated as a hit too. Fires at most once per arm: once it leaves, it turns
+     * the Leave toggle back off itself instead of relying on a separate AutoDisable setting.
      */
     private void updateLeave() {
         if (this.mc.thePlayer == null) {
             return;
         }
         if (!this.leave.getValue().booleanValue()) {
-            this.lastHealth = -1.0f;
             this.armorBaselineSet = false;
             return;
         }
-        float health = this.mc.thePlayer.getHealth();
-        boolean hit = this.lastHealth >= 0.0f && health < this.lastHealth;
-        this.lastHealth = health;
+        boolean hit = this.mc.thePlayer.hurtTime > 0;
         ItemStack[] armor = this.mc.thePlayer.inventory.armorInventory;
         if (!hit && this.armorBaselineSet) {
             for (int i = 0; i < armor.length; ++i) {
