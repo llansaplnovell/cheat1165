@@ -6,10 +6,12 @@ import Magic.ink.event.s.EventPreUpdate;
 import Magic.mod.Category;
 import Magic.mod.Module;
 import Magic.mod.value.values.BoolValue;
+import Magic.mod.value.values.NumberValue;
 import Magic.utils.math.Timer;
 import Magic.utils.player.ClientUtils;
 import net.minecraft.client.Minecraft;
 import net.minecraft.entity.Entity;
+import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.entity.projectile.EntityFishHook;
 import net.minecraft.inventory.Slot;
 import net.minecraft.item.ItemFishingRod;
@@ -23,15 +25,20 @@ import pisi.unitedmeows.eventapi.event.listener.Listener;
 public class AutoFish extends Module {
     private BoolValue afk = new BoolValue("Afk", (Module)this, false, "");
     private BoolValue leave = new BoolValue("Leave", (Module)this, false, "Leaves the moment you take any damage while AutoFish is running, even damage the rod itself caused. If a hit doesn't show up as health loss, a drop in worn armor durability is used as a fallback detector. Turns itself back off after firing.");
+    private BoolValue guard = new BoolValue("Guard", (Module)this, false, "Holds off reeling in while another player is standing right next to your bobber, so they can't steal the catch. Reels in automatically the moment they back off.");
+    private NumberValue<Float> guardRange = new NumberValue<Float>("Range", this, 1.0f, 0.5f, 5.0f, 0.5f, "How close another player has to be to your bobber to count as contesting it.", () -> this.guard.getValue() != false);
     private Timer timer = new Timer();
     private long lastVelTime;
     private int lastAfkTick;
     private double prevY;
     private final int[] lastArmorDamage = new int[4];
     private boolean armorBaselineSet;
+    private boolean pendingReel;
+    private double pendingReelExtra;
     public Listener<EventPreUpdate> updateEvent = new Listener<EventPreUpdate>(event -> {
         boolean canAfk;
         this.updateLeave();
+        this.updatePendingReel();
         if (!this.isHoldingFishingRod()) {
             this.getOtherRods();
             return;
@@ -91,6 +98,7 @@ public class AutoFish extends Module {
     @Override
     public void onDisable() {
         this.armorBaselineSet = false;
+        this.pendingReel = false;
         super.onDisable();
     }
 
@@ -137,7 +145,62 @@ public class AutoFish extends Module {
         this.leave.setValue(false);
     }
 
+    /**
+     * Retries a reel that pullBack() deferred because the bobber was contested. Runs every tick
+     * so the catch is grabbed the instant the area clears, instead of only re-checking on the
+     * next bite packet (which might not come again for that same fish).
+     */
+    private void updatePendingReel() {
+        if (!this.pendingReel || this.mc.thePlayer == null) {
+            return;
+        }
+        if (this.mc.thePlayer.fishEntity == null) {
+            this.pendingReel = false;
+            return;
+        }
+        if (this.isBobberContested()) {
+            return;
+        }
+        this.pendingReel = false;
+        this.reelIn(this.pendingReelExtra);
+    }
+
+    /**
+     * True while Guard is on, a bobber is actually out, and another player is standing within
+     * guardRange of it - i.e. close enough to also be able to right-click the loot the instant
+     * it lands. Your own player never counts against yourself.
+     */
+    private boolean isBobberContested() {
+        if (!this.guard.getValue().booleanValue()) {
+            return false;
+        }
+        EntityFishHook hook = this.mc.thePlayer.fishEntity;
+        if (hook == null) {
+            return false;
+        }
+        float range = ((Float)this.guardRange.getValue()).floatValue();
+        for (EntityPlayer player : ClientUtils.getPlayers()) {
+            if (player == this.mc.thePlayer || player.isDead) {
+                continue;
+            }
+            if (player.getDistanceToEntity(hook) < range) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void pullBack(double additionalValue) {
+        if (this.isBobberContested()) {
+            this.pendingReel = true;
+            this.pendingReelExtra = additionalValue;
+            ClientUtils.debug((Object)"AutoFish: someone's next to the bobber, holding the reel.");
+            return;
+        }
+        this.reelIn(additionalValue);
+    }
+
+    private void reelIn(double additionalValue) {
         if (this.afk.getValue().booleanValue()) {
             boolean canAfk;
             boolean bl = canAfk = Minecraft.getRunTick() - this.lastAfkTick > 210;

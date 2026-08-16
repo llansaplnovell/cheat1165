@@ -69,6 +69,31 @@ two SkyPvP-participant modules).
   it's turned on, and again on `onDisable()`, so re-arming never compares
   against stale numbers from before it was armed.
 
+## AutoFish: Guard toggle (anti-steal)
+
+`AutoFish` also gained a `Guard` `BoolValue` (off by default) plus a
+`Range` `NumberValue<Float>` (default `1.0`, `0.5-5.0`, only shown while
+`Guard` is on): while enabled, AutoFish won't reel in as long as another
+player is standing within `Range` blocks of the bobber (`mc.thePlayer.fishEntity`)
+- close enough to right-click the loot themselves the instant it lands.
+
+This isn't a hard cancel — `pullBack()` (triggered by the bite packets in
+`onReceive`, both the hook velocity packet and the splash-sound path) checks
+`isBobberContested()` first. If contested, instead of reeling it just
+records `pendingReel = true` and the pull strength it would have used, and
+returns without touching the rod. From then on `updatePendingReel()` runs
+every tick (from `updateEvent`, alongside `updateLeave()`) and reels the
+moment `isBobberContested()` goes false, using the recorded pull strength -
+so the catch is still grabbed the instant the area clears, rather than
+being lost because the one bite packet that would have triggered a normal
+reel already passed. If the hook itself disappears while still pending
+(catch missed, line timed out, etc.) the pending state is just dropped.
+`isBobberContested()` walks `ClientUtils.getPlayers()` and skips the local
+player, so it never blocks on itself. The original reel body (the
+afk-aware double right-click + debug log) was factored out into `reelIn()`
+so both the immediate and the deferred path share it instead of duplicating
+the logic.
+
 ## Files
 
 - `ArmorLeave.java` — full source for the new module.
