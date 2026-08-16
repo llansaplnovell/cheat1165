@@ -185,12 +185,13 @@ public class AutoFish extends Module {
             this.guardContestedLast = false;
             return;
         }
-        boolean contested = this.isBobberContested();
+        String reason = this.findContestingReason();
+        boolean contested = reason != null;
         if (contested == this.guardContestedLast) {
             return;
         }
         this.guardContestedLast = contested;
-        ClientUtils.debug((Object)(contested ? "Guard: line is contested, holding the reel." : "Guard: line is clear again."));
+        ClientUtils.debug((Object)(contested ? "Guard: line is contested (" + reason + "), holding the reel." : "Guard: line is clear again."));
     }
 
     /**
@@ -199,23 +200,36 @@ public class AutoFish extends Module {
      * So "is someone standing on my line" can't be looked up, it has to be computed: approximate
      * the line as the straight segment from the rod tip (the local player's eye position is the
      * closest thing available) to the hook's real position, then test every other player's
-     * actual (padded) hitbox against that segment with vanilla's own ray-vs-AABB routine -
+     * actual (padded) hitbox against that whole segment with vanilla's own ray-vs-AABB routine -
      * AxisAlignedBB.calculateIntercept, the exact primitive NameTags already uses in this client
-     * to figure out which hook the crosshair is hovering. A plain point-to-point distance check
-     * against just the hook's coordinate would miss anyone standing further back along the line,
-     * which is the case that was reported broken.
+     * to figure out which hook the crosshair is hovering. This is a capsule test (a "thick line"
+     * running the full length of the rod-to-hook segment, width = Range on every side), not a
+     * circle around a single point, so it does NOT flag someone standing near the hook but off
+     * to the side of where the line actually runs, nor does it flag anyone based on distance
+     * alone if they aren't actually near the segment.
      *
      * isNearHook() is kept as a belt-and-braces fallback for the one quirk in that routine: a
      * ray whose start point is already inside the target box can return no intercept, which
-     * would otherwise let someone standing exactly on top of the hook slip through undetected.
+     * would otherwise let someone standing exactly on top of the hook (the working end of the
+     * capsule) slip through undetected. It's scoped to the hook's own box expanded by Range, so
+     * it only matters right at that end, not anywhere else along or off the line.
      */
     private boolean isBobberContested() {
+        return this.findContestingReason() != null;
+    }
+
+    /**
+     * Same check as isBobberContested(), but returns which sub-check actually fired (or null if
+     * neither did) so callers can log it - useful for confirming during testing that a "contested"
+     * result really is someone on the line/hook and not a stray false positive.
+     */
+    private String findContestingReason() {
         if (!this.guard.getValue().booleanValue()) {
-            return false;
+            return null;
         }
         EntityFishHook hook = this.mc.thePlayer.fishEntity;
         if (hook == null) {
-            return false;
+            return null;
         }
         float range = ((Float)this.guardRange.getValue()).floatValue();
         Vec3 rodTip = this.mc.thePlayer.getPositionEyes(1.0f);
@@ -224,11 +238,14 @@ public class AutoFish extends Module {
             if (player == this.mc.thePlayer || player.isDead) {
                 continue;
             }
-            if (this.isNearHook(player, hook, range) || this.isBlockingLine(player, rodTip, hookPos, range)) {
-                return true;
+            if (this.isBlockingLine(player, rodTip, hookPos, range)) {
+                return "on the line, " + player.getName();
+            }
+            if (this.isNearHook(player, hook, range)) {
+                return "on the hook, " + player.getName();
             }
         }
-        return false;
+        return null;
     }
 
     private boolean isNearHook(EntityPlayer player, EntityFishHook hook, float range) {
@@ -243,10 +260,11 @@ public class AutoFish extends Module {
     }
 
     private void pullBack(double additionalValue) {
-        if (this.isBobberContested()) {
+        String reason = this.findContestingReason();
+        if (reason != null) {
             this.pendingReel = true;
             this.pendingReelExtra = additionalValue;
-            ClientUtils.debug((Object)"AutoFish: someone's next to the bobber, holding the reel.");
+            ClientUtils.debug((Object)("AutoFish: bite came in but line is contested (" + reason + "), holding the reel."));
             return;
         }
         this.reelIn(additionalValue);

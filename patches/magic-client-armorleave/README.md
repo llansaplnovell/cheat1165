@@ -126,6 +126,21 @@ from the contest check (guarding against yourself makes no sense), so
 standing at your own bobber solo won't trigger anything — it needs a
 second character/account nearby to actually verify.
 
+**On "is this just a circle again":** the pre-line-fix version really was
+a plain circle around the hook's coordinate (`getDistanceToEntity(hook) <
+range`), so a player who couldn't plausibly reach the catch could still
+trip it if they happened to be within `range` of that one point. The
+segment version isn't that: `isBlockingLine()`'s capsule spans the *whole*
+rod-tip-to-hook segment, so a player has to actually be near some point
+along that segment, not just near the hook's coordinate, to trigger it.
+The only remaining circular check, `isNearHook()`, is scoped to the hook's
+own box (the capsule's working end-cap), not some unrelated point. To make
+this verifiable rather than just asserted, `findContestingReason()` now
+returns *which* check fired and who triggered it, and both
+`updateGuardLog()` and `pullBack()`'s debug lines include it — e.g. `Guard:
+line is contested (on the line, Steve), holding the reel.` — so it's
+directly visible in chat during testing which of the two checks matched.
+
 ## Files
 
 - `ArmorLeave.java` — full source for the new module.
